@@ -1,0 +1,14 @@
+# Copy to `.dev.vars` for `wrangler dev`. Never commit the real file.
+#
+# The admin surface (/__admin/*) stays closed while SYNC_TOKEN is unset.
+SYNC_TOKEN=dev-token
+
+# Keep interactive verification quick; production defaults are in wrangler.toml.
+SYNC_MAX_SONGS_PER_TICK=1
+SYNC_BUDGET_MS=600000
+
+# Google Drive credentials (from OpenList / Google Cloud Console OAuth 2.0 Client)
+# GDRIVE_CLIENT_ID=your-client-id.apps.googleusercontent.com
+# GDRIVE_CLIENT_SECRET=GOCSPX-your-secret
+# GDRIVE_REFRESH_TOKEN=1//your-refresh-token
+# GDRIVE_FOLDER_ID=root  # optional, leave empty to auto-create "RhyDiveMirror" folder

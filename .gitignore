@@ -1,0 +1,25 @@
+# dependencies
+node_modules/
+worker/node_modules/
+
+# wrangler local state (Miniflare R2 simulation lives here)
+worker/.wrangler/
+worker/.wrangler-*/
+worker/dist/
+.wrangler/
+
+# local secrets — never commit
+.dev.vars
+worker/.dev.vars
+*.secret
+
+# reverse-engineering artifacts & private notes (kept local, never committed)
+analysis/
+docs/API.md
+tools/asar-extract.mjs
+tools/probe-stats.mjs
+
+# misc
+.deepseek-harness/
+*.log
+.DS_Store
