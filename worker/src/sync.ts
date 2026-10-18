@@ -84,12 +84,10 @@ export async function releaseSyncLease(bucket: R2Bucket, owner: string): Promise
   if (current?.owner === owner) await bucket.delete(KEYS.syncLock);
 }
 
-const MIN_LEASE_MS = 15 * 60_000 + 60_000;
-
 function leaseTtlMs(config: Config): number {
-  // A single archive request can take up to 15 minutes. The lease must not
-  // expire while that request is still advancing a song.
-  return Math.max(config.budgetMs * 3, MIN_LEASE_MS);
+  // Keep a short recovery window, then renew after every completed song. A
+  // crashed invocation must not hold the queue for a full archive timeout.
+  return Math.max(config.budgetMs, 90_000);
 }
 
 export async function renewSyncLease(bucket: R2Bucket, owner: string, ttlMs: number): Promise<void> {
@@ -220,6 +218,9 @@ async function runSyncUnlocked(
       state.songs[songId] = record;
       delete failures[songId];
       processed += 1;
+      if (lockOwner) {
+        await renewSyncLease(env.MIRROR, lockOwner, leaseTtlMs(config));
+      }
     } catch (error) {
       if (isSubrequestLimitError(error)) {
         // The remaining songs were not attempted. Stop this invocation without
