@@ -61,6 +61,7 @@ let totalFailed = 0;
 let stalled = false;
 let exhausted = false;
 let busyRetries = 0;
+let transientRetries = 0;
 
 for (; round < maxRounds; round++) {
   const before = await getStatus();
@@ -84,6 +85,16 @@ for (; round < maxRounds; round++) {
     continue;
   }
   busyRetries = 0;
+  if (response.status >= 500) {
+    transientRetries += 1;
+    if (transientRetries > 8) fail(`sync round ${round + 1} failed after repeated HTTP ${response.status}`);
+    const waitMs = Math.min(30_000, 1_000 * 2 ** (transientRetries - 1));
+    if (!jsonOutput) console.log(`round ${round + 1}: transient HTTP ${response.status}; retrying in ${waitMs} ms`);
+    round -= 1;
+    await sleep(waitMs);
+    continue;
+  }
+  transientRetries = 0;
   if (!response.ok || !payload?.success) {
     fail(`sync round ${round + 1} failed: HTTP ${response.status} ${JSON.stringify(payload)}`);
   }
