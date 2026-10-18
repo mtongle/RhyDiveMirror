@@ -82,7 +82,7 @@ _objects/assets/<id>/<sha256>/<name>         不可变资源代次
 6. 写入不可变对象，切换代次指针。
 7. 清理已下架曲目并写回状态。
 
-失败曲目保留在队列中并按 1 分钟起、6 小时上限的指数退避重试。状态保存使用 ETag 条件写；竞争写入会报告冲突，不会静默覆盖较新的进度。
+失败曲目保留在队列中并按 1 分钟起、6 小时上限的指数退避重试。状态保存使用 ETag 条件写；竞争写入会报告冲突，不会静默覆盖较新的进度。完整官方目录另存于 `_catalog/official-library.json`：`skipCatalog=true` 的轮次只读 R2 缓存，仍会重新生成完整镜像目录并把本轮新完成曲目发布出去；定期刷新轮次重新拉取官方目录，用于发现新歌、下架和上游更新。
 
 ### 并发控制
 
@@ -150,7 +150,7 @@ node tools/sync.mjs --worker https://<worker> --token "$SYNC_TOKEN"
 node tools/verify-mirror.mjs --worker https://<worker> --deep
 ```
 
-`sync.mjs` 遇到 `409 sync_busy` 会等待并重试；队列仍非空时以非零状态退出。`verify-mirror.mjs` 检查健康、目录、清单限制、ZIP 哈希、条目集合、资源哈希、Range、下载站表面、代理与路径穿越。
+`sync.mjs` 遇到 `409 sync_busy` 会等待并重试，控制面 HTTP 429/502/503/504 和传输错误按有界指数退避重试，单次请求有硬超时。默认每 20 轮刷新一次官方目录，其余轮次传 `skipCatalog=true` 使用 R2 缓存；可用 `--catalog-every` 调整。队列仍非空时脚本以非零状态退出。`verify-mirror.mjs` 检查健康、目录、清单限制、ZIP 哈希、条目集合、资源哈希、Range、下载站表面、代理与路径穿越。
 
 ## 8. 运行与诊断
 
