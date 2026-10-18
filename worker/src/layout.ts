@@ -64,6 +64,20 @@ export function safeEntryName(value: string): string | null {
   } catch {
     return null;
   }
+  return validateEntryName(decoded);
+}
+
+/**
+ * Validate an archive-relative name that is already raw text. ZIP and manifest
+ * entry names are not URL paths, so a literal `%` is legal and must not be
+ * treated as a broken percent-escape. Request paths still use safeEntryName,
+ * which decodes and therefore rejects encoded traversal.
+ */
+export function safeManifestEntryName(value: string): string | null {
+  return validateEntryName(value);
+}
+
+function validateEntryName(decoded: string): string | null {
   const normalized = decoded
     .replaceAll('\\', '/')
     .normalize('NFC')

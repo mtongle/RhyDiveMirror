@@ -23,6 +23,7 @@ const songs: FixtureSong[] = [
     entries: [
       { name: 'bg.jpg', data: 'beta-cover' },
       { name: 'SB/D1.png', data: 'beta-storyboard', store: true },
+      { name: 'SB/Font/%.png', data: 'literal-percent-font' },
     ],
   },
 ];

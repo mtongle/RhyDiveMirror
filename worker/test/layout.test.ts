@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { classify, hasAssetExtension, safeEntryName, SONG_ID_PATTERN } from '../src/layout';
+import { classify, hasAssetExtension, safeEntryName, safeManifestEntryName, SONG_ID_PATTERN } from '../src/layout';
 
 const layout = { apiPrefix: '/api/rhydive' };
 
@@ -104,6 +104,15 @@ describe('safeEntryName', () => {
     expect(safeEntryName('trailing. ')).toBeNull();
     expect(safeEntryName('CON.png')).toBeNull();
     expect(safeEntryName('bad|name.png')).toBeNull();
+    expect(safeEntryName('SB/Font/%.png')).toBeNull();
+  });
+
+  it('accepts literal percent signs in raw archive entries', () => {
+    expect(safeManifestEntryName('SB/Font/%.png')).toBe('SB/Font/%.png');
+    expect(safeManifestEntryName('SB\\Font\\%.png')).toBe('SB/Font/%.png');
+    expect(safeManifestEntryName('a/../%.png')).toBeNull();
+    expect(safeManifestEntryName('%2e%2e/secret.png')).toBe('%2e%2e/secret.png');
+    expect(safeEntryName('%2e%2e/secret.png')).toBeNull();
   });
 });
 

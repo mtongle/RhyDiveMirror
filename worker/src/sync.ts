@@ -10,7 +10,7 @@ import { KEYS, type Config, type Env } from './config';
 import { contentTypeFor, isHotAsset } from './assets';
 import { globalFetch, type FetchLike } from './fetch';
 import { sha256Hex } from './http';
-import { SONG_ID_PATTERN, safeEntryName } from './layout';
+import { SONG_ID_PATTERN, safeManifestEntryName } from './layout';
 import { OfficialClient, OfficialError, type OfficialCatalog, type OfficialManifest } from './official';
 import { createBulkStore, type BulkStore } from './storage';
 import { extractEntry, readCentralDirectory, type ZipEntry } from './zip';
@@ -391,7 +391,7 @@ export async function syncSong(
     }
     // Check entry name security and exact entry set before publishing.
     for (const file of manifest.files) {
-      if (!safeEntryName(file.name)) throw new Error(`manifest contains unsafe file name: ${file.name}`);
+      if (!safeManifestEntryName(file.name)) throw new Error(`manifest contains unsafe file name: ${file.name}`);
       if (!byName.has(file.name)) throw new Error(`archive for ${songId} is missing manifest entry ${file.name}`);
     }
   }
