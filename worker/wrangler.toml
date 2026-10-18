@@ -12,12 +12,13 @@ routes = [{ pattern = "rhydive-mirror.tongle.dev", custom_domain = true }]
 binding = "MIRROR"
 bucket_name = "rhydive-mirror"
 
-# How often the incremental sync runs. Each tick drains a bounded number of
-# songs, so a short interval converges faster without hammering the origin.
+# How often the incremental sync runs. The lease serialises cron and operator
+# runs; a five-minute interval leaves room for a long bulk drain while still
+# recovering automatically if the local process stops.
 # Free Workers allow 50 subrequests per invocation; eight songs with cached
 # metadata stay safely below that ceiling and recover automatically on 409.
 [triggers]
-crons = ["* * * * *"]
+crons = ["*/5 * * * *"]
 
 [vars]
 OFFICIAL_ORIGIN = "https://sta.lunprin.com"
