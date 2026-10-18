@@ -161,6 +161,11 @@ async function runSyncUnlocked(
     ? { state: options.state, etag: options.stateEtag ?? (await currentStateEtag(env.MIRROR)) }
     : await loadStateWithVersion(env.MIRROR);
   const state = loaded.state;
+  // Reclaim generations that were already retired before this tick. A
+  // generation retired by this run may still have readers from the previous
+  // pointer, so it becomes eligible on the next tick rather than relying on a
+  // wall-clock comparison that can tie for very fast consecutive runs.
+  const previouslyRetired = new Set(state.retired);
   const store = options.store ?? createBulkStore(env, config, fetchImpl);
   const client = new OfficialClient(config, fetchImpl);
   const maxSongs = options.maxSongs ?? config.maxSongsPerTick;
@@ -266,7 +271,7 @@ async function runSyncUnlocked(
   }
   // A generation retired by this tick may still be referenced by a reader that
   // fetched the previous pointer moments ago. Reclaim it on a later tick.
-  await cleanupRetired(env, store, state, maxSongs * 4, errors, startedAt);
+  await cleanupRetired(env, store, state, maxSongs * 4, errors, previouslyRetired);
 
   let repaired = 0;
   if (publishCatalog) {
@@ -321,12 +326,12 @@ async function cleanupRetired(
   state: SyncState,
   budget: number,
   errors: SyncError[],
-  notBefore: number,
+  eligible: ReadonlySet<RetiredGeneration>,
 ): Promise<void> {
   const kept: RetiredGeneration[] = [];
   let removed = 0;
   for (const item of state.retired) {
-    if (Date.parse(item.retiredAt) >= notBefore) {
+    if (!eligible.has(item)) {
       kept.push(item);
       continue;
     }
@@ -566,9 +571,15 @@ async function ensureArchive(
   songId: string,
   manifest: OfficialManifest,
 ): Promise<ArrayBuffer> {
-  const head = await store.head(KEYS.archive(songId)).catch(() => null);
+  // Store mode publishes immutable, content-addressed generations. Checking the
+  // stable compatibility path for every new song is guaranteed to miss and
+  // spends one of the free-plan subrequests before downloading the archive.
+  const key = _config.archiveMode === 'store'
+    ? KEYS.archiveVersion(songId, manifest.archive.sha256)
+    : KEYS.archive(songId);
+  const head = await store.head(key).catch(() => null);
   if (head && head.customMetadata?.sha256 === manifest.archive.sha256 && head.size === manifest.archive.size) {
-    const object = await store.get(KEYS.archive(songId));
+    const object = await store.get(key);
     if (object) return object.arrayBuffer();
   }
   return client.fetchArchive(songId, manifest.archive.size);

@@ -143,6 +143,36 @@ describe('runSync', () => {
     expect(bucket.puts - putsAfterFirst).toBeLessThanOrEqual(5);
   });
 
+  it('checks only the content-addressed archive in store mode', async () => {
+    const { bucket, env, config, fetchImpl } = harness();
+    const alphaHash = (await new OfficialClient(config, fetchImpl).fetchManifest('alpha-1')).archive.sha256;
+    const putsBefore = bucket.puts;
+    await runSync(env, { ...config, maxSongsPerTick: 1 }, {}, fetchImpl);
+    expect(bucket.has(`_objects/archives/alpha-1/${alphaHash}.zip`)).toBe(true);
+    expect(bucket.puts).toBeGreaterThan(putsBefore);
+  });
+
+  it('reuses an orphaned archive generation from a failed commit', async () => {
+    const { bucket, official, env, config, fetchImpl } = harness({ SYNC_MAX_SONGS_PER_TICK: '1' });
+    await runSync(env, config, {}, fetchImpl);
+    const fetches = official.archiveFetches;
+    official.updateSong('alpha-1', [{ name: 'bg.png', data: 'replacement' }]);
+    const replacementHash = official.manifestOf('alpha-1').archive.sha256;
+    const replacementKey = `_objects/archives/alpha-1/${replacementHash}.zip`;
+    bucket.failPutKey = '_catalog/songs/alpha-1.json';
+    bucket.failDeleteKey = replacementKey;
+    const failed = await runSync(env, config, {}, fetchImpl);
+    expect(failed.run.failed).toBe(1);
+    expect(bucket.has(replacementKey)).toBe(true);
+    bucket.failPutKey = null;
+    bucket.failDeleteKey = null;
+    const client = new OfficialClient(config, fetchImpl);
+    const beforeRetry = official.archiveFetches;
+    const record = await syncSong(env, config, client, 'alpha-1', replacementHash);
+    expect(record.archiveHash).toBe(replacementHash);
+    expect(official.archiveFetches).toBe(beforeRetry);
+  });
+
   it('re-syncs a song whose archiveHash changed upstream', async () => {
     const { bucket, official, env, config, fetchImpl } = harness();
     await runSync(env, config, {}, fetchImpl);
