@@ -139,7 +139,15 @@ async function sync(
       { skipCatalog, maxSongs, budgetMs, store },
       fetchImpl,
     );
-    return json({ success: true, run: result.run, pending: result.state.pending.length });
+    return json({
+      success: true,
+      run: result.run,
+      pending: result.state.pending.length,
+      catalog: {
+        officialSongs: result.state.officialSongCount,
+        fetchedAt: result.state.catalogFetchedAt,
+      },
+    });
   } catch (error) {
     if (error instanceof SyncBusyError) {
       return json(

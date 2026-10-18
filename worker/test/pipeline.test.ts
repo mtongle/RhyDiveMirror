@@ -245,7 +245,8 @@ describe('admin surface', () => {
 
     const sync = await call('/__admin/sync', { method: 'POST', headers: { 'x-sync-token': 'secret-token' } });
     expect(sync.status).toBe(200);
-    expect(((await sync.json()) as { success: boolean }).success).toBe(true);
+    expect((await sync.json()) as { success: boolean; catalog: { officialSongs: number } })
+      .toMatchObject({ success: true, catalog: { officialSongs: 2 } });
   });
 
   it('rebuilds catalog state and refuses while another sync holds the lease', async () => {

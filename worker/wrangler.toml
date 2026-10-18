@@ -14,8 +14,10 @@ bucket_name = "rhydive-mirror"
 
 # How often the incremental sync runs. Each tick drains a bounded number of
 # songs, so a short interval converges faster without hammering the origin.
+# Free Workers allow 50 subrequests per invocation; eight songs with cached
+# metadata stay safely below that ceiling and recover automatically on 409.
 [triggers]
-crons = ["*/20 * * * *"]
+crons = ["* * * * *"]
 
 [vars]
 OFFICIAL_ORIGIN = "https://sta.lunprin.com"
@@ -42,8 +44,8 @@ STORAGE_LAYOUT = "hybrid"
 GDRIVE_CHUNK_SIZE_MB = "5"
 # all = every asset; hot = cover/audio/.osu; lazy = archive only
 SYNC_ASSET_MODE = "hot"
-SYNC_MAX_SONGS_PER_TICK = "3"
-SYNC_BUDGET_MS = "20000"
+SYNC_MAX_SONGS_PER_TICK = "8"
+SYNC_BUDGET_MS = "200000"
 MIRROR_FALLBACK_PROXY = "true"
 ASSET_WRITE_THROUGH = "true"
 # MIRROR_API_PREFIX = "/api/rhydive"

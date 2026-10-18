@@ -94,6 +94,9 @@ for (; round < maxRounds; round++) {
   if (!response.ok || !payload?.success) {
     fail(`sync round ${round + 1} failed: HTTP ${response.status} ${JSON.stringify(payload)}`);
   }
+  if (payload.catalog?.officialSongs != null) {
+    before.catalog.officialSongs = payload.catalog.officialSongs;
+  }
 
   totalProcessed += payload.run.processed;
   totalFailed += payload.run.failed;

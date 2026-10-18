@@ -68,8 +68,8 @@ node tools/verify-mirror.mjs --worker https://<worker> --deep
 | `SYNC_ASSET_SOURCE` | `archive` | 从 ZIP 提取，或从官方逐个资源获取。 |
 | `ARCHIVE_MODE` | `store` | `store` 本地保存 ZIP；`proxy` 请求时回源。 |
 | `MIRROR_FALLBACK_PROXY` | `true` | 下载站表面的未命中是否回源。API 表面始终回源。 |
-| `SYNC_MAX_SONGS_PER_TICK` | `6` | 每 tick 最多处理的曲目数。 |
-| `SYNC_BUDGET_MS` | `20000` | 开始下一首前的墙钟预算。 |
+| `SYNC_MAX_SONGS_PER_TICK` | `6` | 每 tick 最多处理的曲目数（仓库部署配置为 8；免费计划建议 6–8）。 |
+| `SYNC_BUDGET_MS` | `20000` | 开始下一首前的墙钟预算；免费计划受单次子请求数限制。 |
 | `GDRIVE_TEAM_DRIVE_ID` | 空 | 共享盘 ID；配置后列表请求使用 `corpora=drive`。 |
 
 仓库默认选择 `SYNC_SOURCE=cdn` 和 `STORAGE_LAYOUT=r2`，无需 Google 凭据即可部署。要把大文件放到 Drive，请显式改为 `hybrid` 或 `gdrive` 并配置下方凭据。单曲同步失败会按 1 分钟起、上限 6 小时退避，详情在 `/__admin/status`。
