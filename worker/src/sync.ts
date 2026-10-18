@@ -85,9 +85,10 @@ export async function releaseSyncLease(bucket: R2Bucket, owner: string): Promise
 }
 
 function leaseTtlMs(config: Config): number {
-  // Keep a short recovery window, then renew after every completed song. A
-  // crashed invocation must not hold the queue for a full archive timeout.
-  return Math.max(config.budgetMs, 90_000);
+  // The run renews after each song. Keep the lease long enough for one large
+  // official archive, but do not make crash recovery scale with the whole
+  // tick budget (a 200-second cron budget would otherwise delay takeover).
+  return Math.min(Math.max(config.budgetMs, 90_000), 120_000);
 }
 
 export async function renewSyncLease(bucket: R2Bucket, owner: string, ttlMs: number): Promise<void> {

@@ -3,7 +3,7 @@ import { resolveConfig, type Env } from '../src/config';
 import { runSync, syncSong } from '../src/sync';
 import { OfficialClient } from '../src/official';
 import { loadState, loadStateWithVersion, SyncBusyError, saveState } from '../src/state';
-import { acquireSyncLease, releaseSyncLease } from '../src/sync';
+import { acquireSyncLease, readSyncLease, releaseSyncLease } from '../src/sync';
 import { FakeR2, asR2Bucket } from './helpers/fake-r2';
 import { FakeOfficial, type FixtureSong } from './helpers/official';
 
@@ -58,6 +58,20 @@ describe('runSync', () => {
       JSON.stringify({ owner: 'stale', acquiredAt: new Date(0).toISOString(), expiresAt: new Date(0).toISOString() }),
     );
     expect((await runSync(env, config, {}, fetchImpl)).run.processed).toBe(2);
+    expect(bucket.has('_catalog/sync-lock.json')).toBe(false);
+  });
+
+  it('bounds the recovery lease even when the tick budget is large', async () => {
+    const { bucket, env, config, fetchImpl } = harness();
+    let observed = 0;
+    const fetchImplWithProbe = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const lease = await readSyncLease(env.MIRROR);
+      if (lease) observed = Math.max(observed, Date.parse(lease.expiresAt) - Date.now());
+      return fetchImpl(input, init);
+    }) as typeof fetch;
+    await runSync(env, { ...config, budgetMs: 600_000 }, {}, fetchImplWithProbe);
+    expect(observed).toBeGreaterThan(30_000);
+    expect(observed).toBeLessThanOrEqual(125_000);
     expect(bucket.has('_catalog/sync-lock.json')).toBe(false);
   });
 
