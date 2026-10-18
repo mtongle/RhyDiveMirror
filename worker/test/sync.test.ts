@@ -126,7 +126,7 @@ describe('runSync', () => {
       .filter((key) => key !== '_catalog/sync-lock.json')
       .filter((key) => !key.startsWith('_catalog/library.json') && key !== '_catalog/sync-state.json');
     expect(contentPuts.length).toBeGreaterThan(0);
-    expect(bucket.puts - putsAfterFirst).toBeLessThanOrEqual(4);
+    expect(bucket.puts - putsAfterFirst).toBeLessThanOrEqual(5);
   });
 
   it('re-syncs a song whose archiveHash changed upstream', async () => {
@@ -201,6 +201,35 @@ describe('runSync', () => {
       bucket.json<{ songs: unknown[] }>('_catalog/library.json').songs,
     ).toHaveLength(2);
     expect(official.catalogFetches).toBe(2);
+  });
+
+  it('uses the cached official catalog without omitting newly mirrored songs', async () => {
+    const { bucket, official, env, config, fetchImpl } = harness({ SYNC_MAX_SONGS_PER_TICK: '1' });
+    await runSync(env, config, {}, fetchImpl);
+    const fetches = official.catalogFetches;
+
+    const second = await runSync(env, config, { skipCatalog: true }, fetchImpl);
+    expect(second.run.processed).toBe(1);
+    expect(second.run.catalogFetched).toBe(false);
+    expect(official.catalogFetches).toBe(fetches);
+    expect(bucket.json<{ songs: { id: string }[] }>('_catalog/library.json').songs.map((song) => song.id))
+      .toEqual(['alpha-1', 'beta-2']);
+    expect(bucket.has('_catalog/official-library.json')).toBe(true);
+  });
+
+  it('uses a cached official catalog to publish songs when refresh fails', async () => {
+    const { bucket, official, env, config, fetchImpl } = harness({ SYNC_MAX_SONGS_PER_TICK: '1' });
+    await runSync(env, config, {}, fetchImpl);
+    official.failCatalog = true;
+
+    const second = await runSync(env, config, {}, fetchImpl);
+    expect(second.run.catalogFetched).toBe(false);
+    expect(second.run.processed).toBe(1);
+    expect(second.run.errors[0]?.id).toBe('*');
+    const cached = bucket.json<{ songs: { id: string }[] }>('_catalog/official-library.json');
+    expect(cached.songs.map((song) => song.id)).toEqual(['alpha-1', 'beta-2']);
+    expect(bucket.json<{ songs: { id: string }[] }>('_catalog/library.json').songs.map((song) => song.id))
+      .toEqual(['alpha-1', 'beta-2']);
   });
 
   it('drops songs that disappeared upstream and reclaims their objects', async () => {

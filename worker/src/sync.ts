@@ -167,12 +167,19 @@ async function runSyncUnlocked(
   const errors: SyncError[] = [];
 
   let catalog: OfficialCatalog | null = null;
+  let publishCatalog: OfficialCatalog | null = null;
   let catalogChanged = false;
   const catalogHashes = new Map<string, string>();
 
   if (!options.skipCatalog) {
     try {
       catalog = await client.fetchCatalog();
+      publishCatalog = catalog;
+      // The cache is an optimisation, not part of publishing. A failed cache
+      // write must not prevent the freshly validated catalog from being used.
+      await env.MIRROR.put(KEYS.officialCatalog, JSON.stringify(catalog), {
+        httpMetadata: { contentType: 'application/json; charset=utf-8', cacheControl: 'no-store' },
+      }).catch(() => undefined);
       for (const song of catalog.songs) catalogHashes.set(song.id, song.archiveHash);
       const plan = planPending(state, catalog.songs);
       state.catalogFetchedAt = new Date().toISOString();
@@ -184,7 +191,7 @@ async function runSyncUnlocked(
       errors.push({ id: '*', message: describe(error), at: new Date().toISOString() });
     }
   } else {
-    const cached = await readCachedCatalog(env);
+    const cached = await readOfficialCatalog(env);
     if (cached) {
       for (const song of cached.songs) catalogHashes.set(song.id, song.archiveHash);
     }
@@ -261,12 +268,18 @@ async function runSyncUnlocked(
   await cleanupRetired(env, store, state, maxSongs * 4, errors, startedAt);
 
   let repaired = 0;
-  if (catalog) {
-    ({ repaired } = await writeMirrorCatalog(env, catalog, state, config.hashMode));
-  } else if (catalogChanged || Object.keys(state.songs).length !== state.officialSongCount) {
-    // Catalog fetch failed but we may still have a cached catalog to re-scope.
-    const cached = await readCachedCatalog(env);
-    if (cached) ({ repaired } = await writeMirrorCatalog(env, cached, state, config.hashMode));
+  if (publishCatalog) {
+    ({ repaired } = await writeMirrorCatalog(env, publishCatalog, state, config.hashMode));
+  } else {
+    // A cached catalog was sufficient to keep the queue moving. A failed
+    // refresh must not make the public index omit songs mirrored this tick.
+    const cached = await readOfficialCatalog(env);
+    if (cached) {
+      ({ repaired } = await writeMirrorCatalog(env, cached, state, config.hashMode));
+    } else if (catalogChanged || Object.keys(state.songs).length !== state.officialSongCount) {
+      const mirror = await readCachedCatalog(env);
+      if (mirror) ({ repaired } = await writeMirrorCatalog(env, mirror, state, config.hashMode));
+    }
   }
 
   const run: SyncRun = {
@@ -603,6 +616,20 @@ export async function writeMirrorCatalog(
 async function readCachedCatalog(env: Env): Promise<OfficialCatalog | null> {
   const object = await env.MIRROR.get(KEYS.library);
   if (!object) return null;
+  try {
+    const parsed = JSON.parse(await object.text()) as OfficialCatalog;
+    return parsed && Array.isArray(parsed.songs) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+async function readOfficialCatalog(env: Env): Promise<OfficialCatalog | null> {
+  const object = await env.MIRROR.get(KEYS.officialCatalog);
+  if (!object) {
+    // Existing deployments predate the separate official-catalog cache.
+    return readCachedCatalog(env);
+  }
   try {
     const parsed = JSON.parse(await object.text()) as OfficialCatalog;
     return parsed && Array.isArray(parsed.songs) ? parsed : null;

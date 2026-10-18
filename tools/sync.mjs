@@ -27,6 +27,8 @@ Options:
   --token TOKEN      Admin token (or SYNC_TOKEN)
   --songs N          Songs requested per round (default 25)
   --budgetMs N       Per-round wall-clock budget (default 120000)
+  --requestTimeoutMs N  Hard timeout for one sync request (default 180000)
+  --catalog-every N  Refresh the official catalog every N rounds (default 20)
   --max-rounds N     Maximum attempts (default 10000)
   --pause MS         Delay between successful rounds (default 0)
   --status           Print status and exit
@@ -43,6 +45,8 @@ const songs = positiveInt(args.songs, 6, '--songs');
 const budgetMs = positiveInt(args.budgetMs, 120_000, '--budgetMs');
 const maxRounds = positiveInt(args['max-rounds'], 10_000, '--max-rounds');
 const pauseMs = nonNegativeInt(args.pause, 0, '--pause');
+const requestTimeoutMs = positiveInt(args.requestTimeoutMs, 180_000, '--requestTimeoutMs');
+const catalogEvery = positiveInt(args['catalog-every'], 20, '--catalog-every');
 const jsonOutput = Boolean(args.json);
 
 if (!worker) fail('missing --worker (or RHYDIVE_MIRROR_WORKER)');
@@ -61,7 +65,6 @@ let totalFailed = 0;
 let stalled = false;
 let exhausted = false;
 let busyRetries = 0;
-let transientRetries = 0;
 
 for (; round < maxRounds; round++) {
   const before = await getStatus();
@@ -70,10 +73,13 @@ for (; round < maxRounds; round++) {
     break;
   }
 
-  const response = await fetch(`${worker}/__admin/sync?songs=${songs}&budgetMs=${budgetMs}`, {
-    method: 'POST',
-    headers,
-  });
+  const refreshCatalog = round % catalogEvery === 0;
+  const query = `songs=${songs}&budgetMs=${budgetMs}${refreshCatalog ? '' : '&skipCatalog=true'}`;
+  const response = await requestWithRetry(
+    `${worker}/__admin/sync?${query}`,
+    { method: 'POST', headers },
+    requestTimeoutMs,
+  );
   const payload = await response.json().catch(() => null);
   if (response.status === 409) {
     busyRetries += 1;
@@ -85,16 +91,6 @@ for (; round < maxRounds; round++) {
     continue;
   }
   busyRetries = 0;
-  if (response.status >= 500) {
-    transientRetries += 1;
-    if (transientRetries > 8) fail(`sync round ${round + 1} failed after repeated HTTP ${response.status}`);
-    const waitMs = Math.min(30_000, 1_000 * 2 ** (transientRetries - 1));
-    if (!jsonOutput) console.log(`round ${round + 1}: transient HTTP ${response.status}; retrying in ${waitMs} ms`);
-    round -= 1;
-    await sleep(waitMs);
-    continue;
-  }
-  transientRetries = 0;
   if (!response.ok || !payload?.success) {
     fail(`sync round ${round + 1} failed: HTTP ${response.status} ${JSON.stringify(payload)}`);
   }
@@ -148,12 +144,56 @@ else {
 if (!summary.complete) process.exitCode = 3;
 
 async function getStatus() {
-  const response = await fetch(`${worker}/__admin/status`, { headers });
+  const response = await requestWithRetry(`${worker}/__admin/status`, { headers }, 30_000);
   const payload = await response.json().catch(() => null);
   if (!response.ok || !payload?.success) {
     fail(`status failed: HTTP ${response.status} ${JSON.stringify(payload)}`);
   }
   return payload;
+}
+
+/**
+ * Retry transient control-plane failures and transport errors. Sync POSTs are
+ * safe to replay because the Worker serialises them with a lease and commits
+ * state using conditional writes.
+ */
+async function requestWithRetry(url, init, timeoutMs) {
+  for (let attempt = 0; ; attempt++) {
+    if (attempt > 0) await sleep(retryDelay(attempt - 1));
+    const signal = AbortSignal.timeout(timeoutMs);
+    let response;
+    try {
+      response = await fetch(url, { ...init, signal });
+    } catch (error) {
+      if (attempt >= 8 || !isRetryableNetworkError(error)) throw error;
+      if (!jsonOutput) console.log(`request retry ${attempt + 1}: network error; retrying in ${retryDelay(attempt)} ms`);
+      continue;
+    }
+    if (![429, 502, 503, 504].includes(response.status) || attempt >= 8) return response;
+    await response.body?.cancel().catch(() => undefined);
+    const waitMs = parseRetryAfter(response.headers.get('retry-after')) ?? retryDelay(attempt);
+    if (!jsonOutput) console.log(`request retry ${attempt + 1}: HTTP ${response.status}; retrying in ${waitMs} ms`);
+  }
+}
+
+function retryDelay(attempt) {
+  return Math.min(30_000, 1_000 * 2 ** attempt);
+}
+
+function parseRetryAfter(value) {
+  if (!value) return null;
+  const seconds = Number(value);
+  if (Number.isFinite(seconds) && seconds >= 0) return Math.min(30_000, seconds * 1_000);
+  const date = Date.parse(value);
+  if (Number.isFinite(date)) return Math.max(0, Math.min(30_000, date - Date.now()));
+  return null;
+}
+
+function isRetryableNetworkError(error) {
+  const code = error?.cause?.code ?? error?.code;
+  if (code === 'ERR_INVALID_URL' || code === 'ERR_INVALID_ARG_TYPE' || code === 'ERR_INVALID_ARG_VALUE') return false;
+  if (error?.cause?.name === 'TimeoutError' || error?.name === 'TimeoutError') return true;
+  return true;
 }
 
 function print(value) {

@@ -32,6 +32,7 @@ export class FakeOfficial {
   archiveFetches = 0;
   cdnCatalogFetches = 0;
   cdnArchiveFetches = 0;
+  failCatalog = false;
 
   private readonly songs = new Map<string, FixtureSong>();
   private readonly zips = new Map<string, Uint8Array>();
@@ -139,6 +140,7 @@ export class FakeOfficial {
 
     if (url.pathname === '/api/rhydive/library') {
       this.catalogFetches += 1;
+      if (this.failCatalog) return jsonResponse({ success: false, message: 'catalog unavailable' }, 503);
       return jsonResponse({
         success: true,
         songs: this.songOrder.map((song) => ({

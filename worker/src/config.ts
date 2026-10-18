@@ -171,6 +171,8 @@ export const DEFAULTS = {
 export const KEYS = {
   /** Mirror-scoped catalog served as `/api/rhydive/library`. */
   library: '_catalog/library.json',
+  /** Complete official catalog used by cached sync ticks. */
+  officialCatalog: '_catalog/official-library.json',
   /** Per-song download manifest served as `/api/rhydive/library/<id>/download`. */
   manifest: (id: string) => `_catalog/manifests/${id}.json`,
   /** Immutable manifest for one published archive generation. */
