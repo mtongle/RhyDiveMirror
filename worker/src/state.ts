@@ -201,6 +201,10 @@ export function planPending(
   const failures = state.failures ?? (state.failures = {});
   for (const song of songs) {
     const failure = failures[song.id];
+    // Subrequest exhaustion is an invocation-wide infrastructure limit, not a
+    // property of the song. Old runs recorded it per song; clear those records
+    // so they cannot inherit a multi-hour backoff.
+    if (failure && /too many subrequests/i.test(failure.lastError)) delete failures[song.id];
     // A changed catalog hash means upstream touched the song: clear the backoff.
     if (failure && failure.catalogHash !== song.archiveHash) delete failures[song.id];
     const record = state.songs[song.id];

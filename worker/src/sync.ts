@@ -74,6 +74,11 @@ export async function acquireSyncLease(bucket: R2Bucket, owner: string, ttlMs: n
   throw new SyncBusyError(await readSyncLease(bucket));
 }
 
+/** Free-plan Workers have a hard per-invocation subrequest quota. */
+export function isSubrequestLimitError(error: unknown): boolean {
+  return /too many subrequests/i.test(error instanceof Error ? error.message : String(error));
+}
+
 export async function releaseSyncLease(bucket: R2Bucket, owner: string): Promise<void> {
   const current = await readSyncLease(bucket);
   if (current?.owner === owner) await bucket.delete(KEYS.syncLock);
@@ -216,6 +221,21 @@ async function runSyncUnlocked(
       delete failures[songId];
       processed += 1;
     } catch (error) {
+      if (isSubrequestLimitError(error)) {
+        // The remaining songs were not attempted. Stop this invocation without
+        // putting them into failure backoff; the next drain can continue them.
+        remaining.push(songId);
+        errors.push({
+          id: '*',
+          message: 'subrequest budget exhausted; stopped this tick before the remaining songs',
+          at: new Date().toISOString(),
+        });
+        const at = state.pending.indexOf(songId);
+        if (at >= 0) {
+          for (const rest of state.pending.slice(at + 1)) remaining.push(rest);
+        }
+        break;
+      }
       failed += 1;
       const message = describe(error);
       const now = new Date().toISOString();

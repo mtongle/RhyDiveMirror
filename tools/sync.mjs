@@ -39,7 +39,7 @@ Exit codes: 0 queue empty, 1 error, 3 queue still incomplete after stop.`);
 
 const worker = (args.worker ?? process.env.RHYDIVE_MIRROR_WORKER ?? '').replace(/\/+$/, '');
 const token = args.token ?? process.env.SYNC_TOKEN ?? '';
-const songs = positiveInt(args.songs, 25, '--songs');
+const songs = positiveInt(args.songs, 6, '--songs');
 const budgetMs = positiveInt(args.budgetMs, 120_000, '--budgetMs');
 const maxRounds = positiveInt(args['max-rounds'], 10_000, '--max-rounds');
 const pauseMs = nonNegativeInt(args.pause, 0, '--pause');
@@ -97,10 +97,17 @@ for (; round < maxRounds; round++) {
     );
     for (const error of payload.run.errors ?? []) console.log(`  ! ${error.id}: ${error.message}`);
   }
-  if (payload.run.processed === 0 && payload.run.failed === 0) {
-    if (!jsonOutput) console.log('no progress made this round; stopping');
-    stalled = true;
-    break;
+  if (payload.run.processed === 0) {
+    if (payload.run.errors?.some((error) => /subrequest budget exhausted/i.test(error.message))) {
+      if (!jsonOutput) console.log('subrequest budget exhausted with no progress; stopping');
+      stalled = true;
+      break;
+    }
+    if (payload.run.failed === 0) {
+      if (!jsonOutput) console.log('no progress made this round; stopping');
+      stalled = true;
+      break;
+    }
   }
   if (pauseMs > 0) await sleep(pauseMs);
 }

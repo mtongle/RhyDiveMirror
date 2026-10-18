@@ -256,6 +256,44 @@ describe('runSync', () => {
     expect(Object.keys(state.songs)).toHaveLength(0);
   });
 
+  it('stops on subrequest exhaustion without failing unattempted songs', async () => {
+    const { env, config, official } = harness();
+    let manifestCalls = 0;
+    const limitedFetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const path = new URL(String(input)).pathname;
+      if (path.includes('/library/alpha-1/download')) {
+        manifestCalls += 1;
+        if (manifestCalls > 0) throw new Error('Too many subrequests by single Worker invocation');
+      }
+      return official.fetch(input, init);
+    }) as typeof fetch;
+    const result = await runSync(env, { ...config, maxSongsPerTick: 2 }, {}, limitedFetch);
+    expect(result.run.failed).toBe(0);
+    expect(result.run.processed).toBe(0);
+    expect(result.state.pending).toEqual(['alpha-1', 'beta-2']);
+    expect(result.state.failures).toEqual({});
+    expect(result.run.errors[0]?.message).toMatch(/subrequest budget exhausted/);
+  });
+
+  it('clears historical per-song subrequest backoff during replanning', async () => {
+    const { env, config, official } = harness();
+    await runSync(env, config, {}, official.fetch as typeof fetch);
+    const state = await loadState(env.MIRROR);
+    state.pending = ['alpha-1'];
+    delete state.songs['alpha-1'];
+    state.failures = {
+      'alpha-1': {
+        count: 8,
+        lastError: 'Too many subrequests by single Worker invocation.',
+        lastAt: new Date().toISOString(),
+        catalogHash: 'old',
+      },
+    };
+    await saveState(env.MIRROR, state, undefined);
+    const next = await runSync(env, config, {}, official.fetch as typeof fetch);
+    expect(next.state.failures?.['alpha-1']).toBeUndefined();
+  });
+
   it('does not materialise assets in lazy mode but still stores the archive', async () => {
     const { bucket, env, fetchImpl } = harness({ SYNC_ASSET_MODE: 'lazy' });
     const config = resolveConfig(env);

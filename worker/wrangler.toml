@@ -33,7 +33,7 @@ SYNC_HASH_MODE = "manifest"
 # Storage layout: "r2" (all bulk in R2), "gdrive" (all bulk in Drive), or
 # "hybrid" (hot assets in R2, archives and cold assets in Drive).
 # gdrive/hybrid require the GDRIVE_* Worker secrets documented in README.
-STORAGE_LAYOUT = "r2"
+STORAGE_LAYOUT = "hybrid"
 # Pinned Google Drive folder for gdrive/hybrid only. Prefer configuring it with
 # `wrangler secret put GDRIVE_FOLDER_ID`; omit it to auto-create/find the folder.
 # GDRIVE_FOLDER_ID = ""
