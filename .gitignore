@@ -5,6 +5,8 @@ worker/node_modules/
 # wrangler local state (Miniflare R2 simulation lives here)
 worker/.wrangler/
 worker/.wrangler-*/
+worker/.runtime-*/
+worker/.upgrade-backup/
 worker/dist/
 .wrangler/
 
@@ -13,13 +15,12 @@ worker/dist/
 worker/.dev.vars
 *.secret
 
-# reverse-engineering artifacts & private notes (kept local, never committed)
-analysis/
-docs/API.md
-tools/asar-extract.mjs
-tools/probe-stats.mjs
+# reverse-engineering artifacts: reproducible, not redistributable
+analysis/app/
+analysis/fixtures/
+analysis/probes/*.json
+analysis/probes/*.zip
 
 # misc
-.deepseek-harness/
 *.log
 .DS_Store

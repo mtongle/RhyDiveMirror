@@ -20,6 +20,8 @@ export interface FakeDriveOptions {
   tokenTtlSeconds?: number;
   /** Reject the first N media reads with 403 to emulate throttling. */
   throttleReads?: number;
+  /** Reject the first N object-name files.list requests with 500. */
+  failLookups?: number;
   /** Storage quota reported by about.get. */
   quotaLimit?: number;
   quotaUsage?: number;
@@ -41,12 +43,14 @@ export class FakeDrive {
   private issuedTokens = new Set<string>();
   private readonly tokenTtl: number;
   private throttleReads: number;
+  private failLookups: number;
   private readonly quotaLimit: number;
   private readonly quotaUsage: number;
 
   constructor(options: FakeDriveOptions = {}) {
     this.tokenTtl = options.tokenTtlSeconds ?? 3600;
     this.throttleReads = options.throttleReads ?? 0;
+    this.failLookups = options.failLookups ?? 0;
     this.quotaLimit = options.quotaLimit ?? 5_000_000_000_000;
     this.quotaUsage = options.quotaUsage ?? 21_000_000_000;
   }
@@ -145,6 +149,10 @@ export class FakeDrive {
   private handleList(url: URL): Response {
     this.lookups += 1;
     const query = url.searchParams.get('q') ?? '';
+    if (this.failLookups > 0 && /name = /.test(query) && !/RhyDiveMirror/.test(query)) {
+      this.failLookups -= 1;
+      return json({ error: { message: 'backend lookup unavailable' } }, 500);
+    }
     const name = /name = '((?:[^'\\]|\\.)*)'/.exec(query)?.[1];
     const parent = /'([^']+)' in parents/.exec(query)?.[1];
     const decodedName = name?.replace(/\\(.)/g, '$1');

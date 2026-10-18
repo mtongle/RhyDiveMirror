@@ -21,9 +21,25 @@ import { createHash } from 'node:crypto';
 import { inflateRawSync } from 'node:zlib';
 
 const args = parseArgs(process.argv.slice(2));
+
+if (args.help) {
+  console.log(`Usage: node tools/verify-mirror.mjs --worker URL [options]
+
+Checks a deployed mirror with the same invariants the RhyDive client uses.
+
+Options:
+  --worker URL     Deployed mirror URL (or RHYDIVE_MIRROR_WORKER)
+  --song ID        Pin a song; otherwise one mirrored song is sampled
+  --deep           Verify every archive entry instead of a sample
+  --sample N       Entries checked without --deep (default 5)
+  --help           Show this help
+
+Exit codes: 0 all checks passed, 1 a check failed, 2 usage/fatal error.`);
+  process.exit(0);
+}
 const worker = (args.worker ?? process.env.RHYDIVE_MIRROR_WORKER ?? '').replace(/\/+$/, '');
 const deep = Boolean(args.deep);
-const sampleLimit = Number(args.sample ?? 5);
+const sampleLimit = positiveInt(args.sample, 5, '--sample');
 if (!worker) fail('missing --worker (or RHYDIVE_MIRROR_WORKER)');
 
 const results = [];
@@ -56,6 +72,21 @@ check(
     manifest.files.every((file) => file.url === `/api/rhydive/assets/${songId}/${file.name.split('/').map(encodeURIComponent).join('/')}`),
   `${manifest?.files?.length ?? 0} files`,
 );
+const manifestFiles = Array.isArray(manifest?.files) ? manifest.files : [];
+check(
+  'manifest names and sizes fit the client limits',
+  manifestFiles.length >= 1 &&
+    manifestFiles.length <= 5000 &&
+    manifestFiles.every(
+      (file) =>
+        typeof file?.name === 'string' &&
+        Number.isSafeInteger(file.size) &&
+        file.size >= 0 &&
+        file.size <= 128 * 1024 * 1024,
+    ) &&
+    manifestFiles.reduce((total, file) => total + file.size, 0) <= 512 * 1024 * 1024,
+  `${manifestFiles.length} files`,
+);
 
 const archiveResponse = await fetch(`${worker}/api/rhydive/library/${encodeURIComponent(songId)}/archive`);
 const archive = new Uint8Array(await archiveResponse.arrayBuffer());
@@ -74,7 +105,14 @@ try {
   const archiveBuffer = Buffer.from(archive.buffer, archive.byteOffset, archive.byteLength);
   const entries = readCentralDirectory(archiveBuffer);
   const byName = new Map(entries.map((entry) => [entry.name, entry]));
-  const targets = deep ? manifest.files : manifest.files.slice(0, sampleLimit);
+  const expectedNames = new Set(manifestFiles.map((file) => file.name.toLowerCase()));
+  const actualNames = new Set(entries.filter((entry) => !entry.name.endsWith('/')).map((entry) => entry.name.toLowerCase()));
+  check(
+    'archive entry count matches the manifest',
+    entries.length === manifestFiles.length && actualNames.size === expectedNames.size,
+    `archive=${entries.length} manifest=${manifestFiles.length}`,
+  );
+  const targets = deep ? manifestFiles : manifestFiles.slice(0, sampleLimit);
   let verified = 0;
   for (const file of targets) {
     const entry = byName.get(file.name);
@@ -91,7 +129,8 @@ try {
   check('archive entries match the manifest', false, String(error.message));
 }
 
-const asset = manifest.files.find((file) => /\.(png|jpg|jpeg|webp|ogg|mp3)$/i.test(file.name)) ?? manifest.files[0];
+const asset = manifestFiles.find((file) => /\.(png|jpg|jpeg|webp|ogg|mp3)$/i.test(file.name)) ?? manifestFiles[0];
+if (!asset) fail('manifest has no asset to verify');
 const assetResponse = await fetch(`${worker}${asset.url}`);
 const assetType = assetResponse.headers.get('content-type') ?? '';
 const assetBytes = new Uint8Array(await assetResponse.arrayBuffer());
@@ -102,8 +141,17 @@ check(
 );
 check('asset matches the manifest sha256', sha256(assetBytes) === asset.sha256, asset.name);
 
-const assetRange = await fetch(`${worker}${asset.url}`, { headers: { range: 'bytes=0-9' } });
-check('asset honours Range', assetRange.status === 206 && (await assetRange.arrayBuffer()).byteLength === 10, `status=${assetRange.status}`);
+const rangeEnd = Math.min(9, asset.size - 1);
+const assetRange = await fetch(`${worker}${asset.url}`, {
+  headers: { range: rangeEnd >= 0 ? `bytes=0-${rangeEnd}` : 'bytes=0-' },
+});
+check(
+  'asset honours Range',
+  asset.size > 0
+    ? assetRange.status === 206 && (await assetRange.arrayBuffer()).byteLength === Math.min(10, asset.size)
+    : assetRange.status === 416,
+  `status=${assetRange.status} size=${asset.size}`,
+);
 
 const cdnCatalog = await fetch(`${worker}/rhydive/beatmap/_catalog/library.json`);
 const cdnType = cdnCatalog.headers.get('content-type') ?? '';
@@ -205,4 +253,11 @@ function parseArgs(argv) {
 function fail(message) {
   console.error(`verify-mirror.mjs: ${message}`);
   process.exit(2);
+}
+
+function positiveInt(value, fallback, label) {
+  if (value === undefined) return fallback;
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed <= 0) fail(`${label} must be a positive integer`);
+  return parsed;
 }

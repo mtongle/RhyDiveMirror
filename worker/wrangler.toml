@@ -3,8 +3,11 @@ main = "src/index.ts"
 compatibility_date = "2024-11-01"
 workers_dev = true
 
-# Chart archives + extracted assets. ~9 GB for the full library in the default
-# "all" asset mode; see docs/ARCHITECTURE.md for the storage budget.
+# Public mirror hostname (requires the zone to be active in this account).
+routes = [{ pattern = "rhydive-mirror.tongle.dev", custom_domain = true }]
+
+# Metadata and the hot/cold bulk objects. Run tools/plan-capacity.mjs for the
+# current library's exact budget; sizes change as the official library grows.
 [[r2_buckets]]
 binding = "MIRROR"
 bucket_name = "rhydive-mirror"
@@ -18,27 +21,34 @@ crons = ["*/20 * * * *"]
 OFFICIAL_ORIGIN = "https://sta.lunprin.com"
 OFFICIAL_CDN_ORIGIN = "https://dl.lunprin.com"
 # Where the sync reads official artifacts from.
-#   api = sta.lunprin.com           (canonical, valid SSL certificate)
-#   cdn = dl.lunprin.com/rhydive/beatmap (Tencent CDN; automatically falls back to API on 526/522)
-SYNC_SOURCE = "api"
+#   api = sta.lunprin.com (canonical API)
+#   cdn = dl.lunprin.com/rhydive/beatmap (official download site)
+# A song missing from the configured source stays queued for a later tick.
+SYNC_SOURCE = "cdn"
 # How to reconcile the catalog's archiveHash with the archive the origin really
 # serves. Re-uploaded songs keep the hash they were first published with, so the
 # two disagree until the official catalog is refreshed.
 #   manifest = publish with the real hash (default)   strict = withhold instead
 SYNC_HASH_MODE = "manifest"
-# Storage layout: "r2" (default), "gdrive" (all bulk in Drive), or "hybrid" (R2 hot + Drive bulk)
-STORAGE_LAYOUT = "hybrid"
-# Pinned Google Drive folder ID (clean single folder in your Drive)
-GDRIVE_FOLDER_ID = "1K7xD0NQn0gG0l2RrJwKB7voCpV4ys65Q"
+# Storage layout: "r2" (all bulk in R2), "gdrive" (all bulk in Drive), or
+# "hybrid" (hot assets in R2, archives and cold assets in Drive).
+# gdrive/hybrid require the GDRIVE_* Worker secrets documented in README.
+STORAGE_LAYOUT = "r2"
+# Pinned Google Drive folder for gdrive/hybrid only. Prefer configuring it with
+# `wrangler secret put GDRIVE_FOLDER_ID`; omit it to auto-create/find the folder.
+# GDRIVE_FOLDER_ID = ""
+# GDRIVE_TEAM_DRIVE_ID = "" # set for shared drives; list uses corpora=drive
 # Resumable chunk size in MB (OpenList defaults to 5 MB; must be multiple of 256 KB)
 GDRIVE_CHUNK_SIZE_MB = "5"
-# all | hot | lazy
+# all = every asset; hot = cover/audio/.osu; lazy = archive only
 SYNC_ASSET_MODE = "hot"
 SYNC_MAX_SONGS_PER_TICK = "3"
 SYNC_BUDGET_MS = "20000"
 MIRROR_FALLBACK_PROXY = "true"
 ASSET_WRITE_THROUGH = "true"
 # MIRROR_API_PREFIX = "/api/rhydive"
+# ARCHIVE_MODE = "store" # or "proxy"
+# SYNC_ASSET_SOURCE = "archive" # or "origin"
 
 [observability]
 enabled = true

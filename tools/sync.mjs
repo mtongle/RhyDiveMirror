@@ -17,12 +17,32 @@
 
 const args = parseArgs(process.argv.slice(2));
 
+if (args.help) {
+  console.log(`Usage: node tools/sync.mjs --worker URL --token TOKEN [options]
+
+Repeatedly drains /__admin/sync until the queue is empty.
+
+Options:
+  --worker URL       Deployed mirror URL (or RHYDIVE_MIRROR_WORKER)
+  --token TOKEN      Admin token (or SYNC_TOKEN)
+  --songs N          Songs requested per round (default 25)
+  --budgetMs N       Per-round wall-clock budget (default 120000)
+  --max-rounds N     Maximum attempts (default 10000)
+  --pause MS         Delay between successful rounds (default 0)
+  --status           Print status and exit
+  --json             JSON output
+  --help             Show this help
+
+Exit codes: 0 queue empty, 1 error, 3 queue still incomplete after stop.`);
+  process.exit(0);
+}
+
 const worker = (args.worker ?? process.env.RHYDIVE_MIRROR_WORKER ?? '').replace(/\/+$/, '');
 const token = args.token ?? process.env.SYNC_TOKEN ?? '';
-const songs = Number(args.songs ?? 3);
-const budgetMs = Number(args.budgetMs ?? 60_000);
-const maxRounds = Number(args['max-rounds'] ?? 10_000);
-const pauseMs = Number(args.pause ?? 1000);
+const songs = positiveInt(args.songs, 25, '--songs');
+const budgetMs = positiveInt(args.budgetMs, 120_000, '--budgetMs');
+const maxRounds = positiveInt(args['max-rounds'], 10_000, '--max-rounds');
+const pauseMs = nonNegativeInt(args.pause, 0, '--pause');
 const jsonOutput = Boolean(args.json);
 
 if (!worker) fail('missing --worker (or RHYDIVE_MIRROR_WORKER)');
@@ -38,7 +58,9 @@ if (args.status) {
 let round = 0;
 let totalProcessed = 0;
 let totalFailed = 0;
-let consecutiveIdleRounds = 0;
+let stalled = false;
+let exhausted = false;
+let busyRetries = 0;
 
 for (; round < maxRounds; round++) {
   const before = await getStatus();
@@ -47,32 +69,23 @@ for (; round < maxRounds; round++) {
     break;
   }
 
-  // If catalog is already fetched and has pending songs, skip refreshing catalog on every round
-  const skipCatalogParam = before.queue.pending > 0 ? '&skipCatalog=true' : '';
-  const response = await fetch(`${worker}/__admin/sync?songs=${songs}&budgetMs=${budgetMs}${skipCatalogParam}`, {
+  const response = await fetch(`${worker}/__admin/sync?songs=${songs}&budgetMs=${budgetMs}`, {
     method: 'POST',
     headers,
-  }).catch((err) => ({ ok: false, status: 0, statusText: err.message }));
-
-  if (!response.ok) {
-    consecutiveIdleRounds++;
-    if (!jsonOutput) console.log(`round ${round + 1}: network error (${response.status}), retrying in 3s...`);
-    if (consecutiveIdleRounds > 10) {
-      fail(`too many consecutive network errors: HTTP ${response.status}`);
-    }
-    await new Promise((resolve) => setTimeout(resolve, 3000));
+  });
+  const payload = await response.json().catch(() => null);
+  if (response.status === 409) {
+    busyRetries += 1;
+    if (busyRetries > 30) fail('sync remained busy for more than 30 attempts');
+    const waitMs = Math.max(1_000, payload?.retryAfterMs ?? 5_000);
+    if (!jsonOutput) console.log(`round ${round + 1}: another sync is active; retrying in ${waitMs} ms`);
+    round -= 1; // A busy lease is not a completed sync round.
+    await sleep(waitMs);
     continue;
   }
-
-  const payload = await response.json().catch(() => null);
-  if (!payload?.success) {
-    consecutiveIdleRounds++;
-    if (!jsonOutput) console.log(`round ${round + 1}: sync call failed (${JSON.stringify(payload)}), retrying in 3s...`);
-    if (consecutiveIdleRounds > 10) {
-      fail(`too many consecutive sync errors: ${JSON.stringify(payload)}`);
-    }
-    await new Promise((resolve) => setTimeout(resolve, 3000));
-    continue;
+  busyRetries = 0;
+  if (!response.ok || !payload?.success) {
+    fail(`sync round ${round + 1} failed: HTTP ${response.status} ${JSON.stringify(payload)}`);
   }
 
   totalProcessed += payload.run.processed;
@@ -84,38 +97,37 @@ for (; round < maxRounds; round++) {
     );
     for (const error of payload.run.errors ?? []) console.log(`  ! ${error.id}: ${error.message}`);
   }
-
   if (payload.run.processed === 0 && payload.run.failed === 0) {
-    consecutiveIdleRounds++;
-    if (consecutiveIdleRounds > 5) {
-      if (!jsonOutput) console.log('no progress made after 5 attempts; stopping');
-      break;
-    }
-    await new Promise((resolve) => setTimeout(resolve, 2000));
-  } else {
-    consecutiveIdleRounds = 0;
+    if (!jsonOutput) console.log('no progress made this round; stopping');
+    stalled = true;
+    break;
   }
-
-  if (pauseMs > 0) await new Promise((resolve) => setTimeout(resolve, pauseMs));
+  if (pauseMs > 0) await sleep(pauseMs);
 }
 
 const after = await getStatus();
+exhausted = round >= maxRounds && after.queue.pending > 0;
 const summary = {
   rounds: round,
   processed: totalProcessed,
   failed: totalFailed,
   catalog: after.catalog,
   queue: after.queue,
-  storageMiB: Math.round((after.storage?.storedBytes ?? 0) / 1024 / 1024),
+  storedMiB: Math.round((after.storage?.storedBytes ?? 0) / 1024 / 1024),
+  storedByTier: after.storage?.storedByTier ?? {},
+  complete: after.queue.pending === 0,
+  stalled,
+  exhausted,
 };
 if (jsonOutput) console.log(JSON.stringify(summary, null, 2));
 else {
   console.log(
     `done: ${summary.processed} processed, ${summary.failed} failed, ` +
       `${after.queue.pending} still pending, mirrored ${after.catalog.mirroredSongs}/${after.catalog.officialSongs} songs, ` +
-      `${summary.storageMiB} MiB in R2`,
+      `${summary.storedMiB} MiB materialised`,
   );
 }
+if (!summary.complete) process.exitCode = 3;
 
 async function getStatus() {
   const response = await fetch(`${worker}/__admin/status`, { headers });
@@ -128,6 +140,24 @@ async function getStatus() {
 
 function print(value) {
   console.log(JSON.stringify(value, null, 2));
+}
+
+function positiveInt(value, fallback, label) {
+  if (value === undefined) return fallback;
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed <= 0) fail(`${label} must be a positive integer`);
+  return parsed;
+}
+
+function nonNegativeInt(value, fallback, label) {
+  if (value === undefined) return fallback;
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed < 0) fail(`${label} must be a non-negative integer`);
+  return parsed;
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function fail(message) {

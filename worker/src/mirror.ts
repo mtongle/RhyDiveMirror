@@ -11,8 +11,8 @@
  */
 import { KEYS, type Config } from './config';
 import { contentTypeFor } from './assets';
-import { parseRange, type ByteRange } from './http';
-import type { BulkStore } from './storage';
+import { parseRange, sha256Hex, type ByteRange } from './http';
+import type { BulkHead, BulkStore } from './storage';
 import { extractEntry, readCentralDirectory } from './zip';
 
 export interface ServeOptions {
@@ -20,6 +20,8 @@ export interface ServeOptions {
   fallbackType?: string;
   /** Allow `If-None-Match` to produce a 304. */
   conditional?: boolean;
+  /** Stable validator chosen by the caller for a content-addressed object. */
+  etag?: string;
 }
 
 export async function serveObject(
@@ -31,7 +33,7 @@ export async function serveObject(
   const head = await store.head(key);
   if (!head) return null;
 
-  const etag = head.etag;
+  const etag = options.etag ?? head.etag ?? deterministicEtag(key, head.size, head.uploaded);
   const contentType = head.contentType ?? options.fallbackType ?? 'application/octet-stream';
   const cacheControl = head.cacheControl ?? 'public, max-age=60';
 
@@ -100,10 +102,65 @@ export async function serveAsset(
   songId: string,
   assetName: string,
 ): Promise<Response | null> {
-  const stored = await serveAssetObject(request, store, songId, assetName);
-  if (stored) return stored;
+  const isHead = request.method === 'HEAD';
+  const generation = await activeGeneration(store, songId);
+  const assetKey = generation?.assetKeys?.[assetName] ?? generation?.assetPaths?.[assetName];
+  const generationEtag = generation ? await assetEtag(generation.archiveHash, assetName) : undefined;
+  if (assetKey) {
+    const versioned = await serveObject(request, store, assetKey, {
+      fallbackType: contentTypeFor(assetName),
+      ...(generationEtag ? { etag: generationEtag } : {}),
+    });
+    if (versioned) return versioned;
+  }
 
-  const archive = await store.get(KEYS.archive(songId));
+  if (!generation) {
+    // Pre-generation deployments only have the stable path.
+    const stored = await serveAssetObject(request, store, songId, assetName);
+    if (stored) return stored;
+  } else if (!assetKey) {
+    // Lazy assets live under the stable key. Refuse a cache left behind by a
+    // previous archive generation; otherwise a re-upload can briefly serve old
+    // bytes under the new manifest.
+    const stableKey = KEYS.asset(songId, assetName);
+    const head = await store.head(stableKey);
+    if (head?.customMetadata?.generation === generation.archiveHash) {
+      const readable = await serveObject(request, store, stableKey, {
+        fallbackType: contentTypeFor(assetName),
+        ...(generationEtag ? { etag: generationEtag } : {}),
+      });
+      if (readable) return readable;
+    }
+  }
+
+  const archiveKey = generation?.archiveKey ?? KEYS.archive(songId);
+  if (isHead) {
+    // Read the central directory directly from the tail of the object.
+    const head = await store.head(archiveKey);
+    if (!head || head.size < 22) return null;
+    const tailLength = Math.min(head.size, 65_557);
+    const tail = await store.get(archiveKey, { offset: head.size - tailLength, length: tailLength });
+    if (!tail) return null;
+    const bytes = new Uint8Array(await tail.arrayBuffer());
+    let entry;
+    try {
+      entry = readCentralDirectory(bytes, head.size - tailLength).find((candidate) => candidate.name === assetName);
+    } catch {
+      return null;
+    }
+    if (!entry) return null;
+    return metadataResponse(request,
+      {
+        size: entry.uncompressedSize,
+        etag: `"${entry.crc32.toString(16)}-${entry.uncompressedSize.toString(16)}"`,
+        uploaded: head.uploaded,
+        contentType: contentTypeFor(assetName),
+      },
+      contentTypeFor(assetName),
+      generationEtag,
+    );
+  }
+  const archive = await store.get(archiveKey);
   if (!archive) return null;
   const bytes = new Uint8Array(await archive.arrayBuffer());
   let entry;
@@ -122,11 +179,13 @@ export async function serveAsset(
   }
 
   const contentType = contentTypeFor(assetName);
+  const etag = generationEtag ?? `"${entry.crc32.toString(16)}-${entry.uncompressedSize.toString(16)}"`;
   if (config.assetWriteThrough) {
     await store
       .put(KEYS.asset(songId, assetName), data, {
         contentType,
         cacheControl: 'public, max-age=31536000, immutable',
+        customMetadata: { generation: generation?.archiveHash ?? '' },
       })
       .catch(() => undefined);
   }
@@ -145,6 +204,7 @@ export async function serveAsset(
     'content-type': contentType,
     'cache-control': 'public, max-age=31536000, immutable',
     'accept-ranges': 'bytes',
+    etag,
   });
   if (range) {
     headers.set('content-length', String(range.length));
@@ -153,6 +213,62 @@ export async function serveAsset(
   }
   headers.set('content-length', String(data.byteLength));
   return new Response(request.method === 'HEAD' ? null : data, { status: 200, headers });
+}
+
+function metadataResponse(request: Request, head: BulkHead, fallbackType: string, fixedEtag?: string): Response {
+  const etag = fixedEtag ?? head.etag ?? deterministicEtagFromSize(head.size, head.uploaded);
+  if (request.headers.get('if-none-match') && matchesEtag(request.headers.get('if-none-match')!, etag)) {
+    return new Response(null, { status: 304, headers: { etag, 'last-modified': head.uploaded.toUTCString() } });
+  }
+  return new Response(null, {
+    headers: {
+      'content-type': head.contentType ?? fallbackType,
+      'cache-control': head.cacheControl ?? 'public, max-age=31536000, immutable',
+      'accept-ranges': 'bytes',
+      etag,
+      'last-modified': head.uploaded.toUTCString(),
+      'content-length': String(head.size),
+    },
+  });
+}
+
+function deterministicEtag(key: string, size: number, uploaded: Date): string {
+  let hash = 0x811c9dc5;
+  for (let index = 0; index < key.length; index++) {
+    hash ^= key.charCodeAt(index);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  hash ^= size >>> 0;
+  return `"${hash.toString(16)}-${size.toString(16)}-${Math.floor(uploaded.getTime() / 1000).toString(16)}"`;
+}
+
+async function assetEtag(archiveHash: string, name: string): Promise<string> {
+  // Content-derived validator: identical across R2 and Drive and across lazy
+  // extraction versus materialised serving paths.
+  return `"${(await sha256Hex(new TextEncoder().encode(`${archiveHash}\0${name}`))).slice(0, 32)}"`;
+}
+
+function deterministicEtagFromSize(size: number, uploaded: Date): string {
+  return `"${size.toString(16)}-${Math.floor(uploaded.getTime() / 1000).toString(16)}"`;
+}
+
+export interface ActiveGeneration {
+  archiveHash: string;
+  archiveKey: string;
+  manifestKey?: string;
+  assetPaths?: Record<string, string>;
+  assetKeys?: Record<string, string>;
+}
+
+export async function activeGeneration(store: BulkStore, songId: string): Promise<ActiveGeneration | null> {
+  const object = await store.get(KEYS.current(songId));
+  if (!object) return null;
+  try {
+    const value = (await object.json()) as ActiveGeneration;
+    return value && typeof value.archiveHash === 'string' && typeof value.archiveKey === 'string' ? value : null;
+  } catch {
+    return null;
+  }
 }
 
 async function serveAssetObject(

@@ -7,6 +7,7 @@ import { describe, expect, it } from 'vitest';
 import { resolveConfig, type Env } from '../src/config';
 import { handleRequest } from '../src/index';
 import { runSync } from '../src/sync';
+import { createBulkStore } from '../src/storage';
 import { FakeR2, asR2Bucket } from './helpers/fake-r2';
 import { FakeDrive } from './helpers/fake-drive';
 import { FakeOfficial, type FixtureSong } from './helpers/official';
@@ -76,32 +77,37 @@ function driveKeys(drive: FakeDrive): string[] {
 }
 
 describe('hybrid layout (R2 metadata + hot assets, Drive bulk)', () => {
-  it('splits archives to Drive and keeps assets in R2', async () => {
+  it('splits archives and cold assets to Drive and keeps hot assets in R2', async () => {
     const { bucket, drive } = await harness({ STORAGE_LAYOUT: 'hybrid' });
 
     expect(bucket.has('_catalog/library.json')).toBe(true);
     expect(bucket.has('_catalog/manifests/alpha-1.json')).toBe(true);
 
-    // assets stay in R2
-    expect(bucket.has('alpha-1/bg.png')).toBe(true);
-    expect(bucket.has('alpha-1/audio.mp3')).toBe(true);
-    expect(bucket.has('alpha-1/chart.osu')).toBe(true);
-    expect(bucket.has('beta-2/bg.jpg')).toBe(true);
-    // archives live in Google Drive, never in R2
-    expect(bucket.has('alpha-1.zip')).toBe(false);
-    expect(bucket.has('beta-2.zip')).toBe(false);
+    // hot: cover / audio / beatmap stay in R2
+    expect(bucket.has(bucket.generation('alpha-1').assetKeys!['bg.png']!)).toBe(true);
+    expect(bucket.has(bucket.generation('alpha-1').assetKeys!['audio.mp3']!)).toBe(true);
+    expect(bucket.has(bucket.generation('alpha-1').assetKeys!['chart.osu']!)).toBe(true);
+    expect(bucket.has(bucket.generation('beta-2').assetKeys!['bg.jpg']!)).toBe(true);
+    // archives never touch R2 in this layout
+    expect(bucket.has(bucket.generation('alpha-1').archiveKey)).toBe(false);
+    expect(bucket.has(bucket.generation('beta-2').archiveKey)).toBe(false);
 
     const keys = driveKeys(drive);
-    expect(keys).toEqual(['alpha-1.zip', 'beta-2.zip']);
+    expect(keys).toContain(bucket.generation('alpha-1').archiveKey);
+    expect(keys).toContain(bucket.generation('beta-2').archiveKey);
+    // cold assets (storyboard frame, background video) go to Drive
+    expect(keys).toContain(bucket.generation('beta-2').assetKeys!['SB/D1.png']!);
+    expect(keys).toContain(bucket.generation('beta-2').assetKeys!['video.mp4']!);
+    expect(keys.filter((key) => key.endsWith('.zip'))).toHaveLength(2);
   });
 
   it('serves assets and archives from whichever tier holds them', async () => {
     const { bucket, call } = await harness({ STORAGE_LAYOUT: 'hybrid', SYNC_ASSET_MODE: 'all' });
-    // asset in R2
-    expect(bucket.has('alpha-1/bg.png')).toBe(true);
-    expect(bucket.has('beta-2/SB/D1.png')).toBe(true);
-    // archive in Drive, not R2
-    expect(bucket.has('alpha-1.zip')).toBe(false);
+    // hot asset: in R2, so the read never reaches Drive
+    expect(bucket.has(bucket.generation('alpha-1').assetKeys!['bg.png']!)).toBe(true);
+    // cold asset: in Drive, not R2
+    expect(bucket.has(bucket.generation('beta-2').assetKeys!['SB/D1.png']!)).toBe(false);
+    expect(bucket.has(bucket.generation('alpha-1').archiveKey)).toBe(false);
 
     const hot = await call('/api/rhydive/assets/alpha-1/bg.png');
     expect(hot.status).toBe(200);
@@ -134,7 +140,7 @@ describe('hybrid layout (R2 metadata + hot assets, Drive bulk)', () => {
       OFFICIAL_CDN_ORIGIN: official.cdnOrigin,
     };
     await runSync(base, resolveConfig(base), {}, routed); // layout r2
-    expect(bucket.has('alpha-1.zip')).toBe(true);
+    expect(bucket.has(bucket.generation('alpha-1').archiveKey)).toBe(true);
 
     const hybrid: Env = { ...base, STORAGE_LAYOUT: 'hybrid', GDRIVE_CLIENT_ID: 'x', GDRIVE_CLIENT_SECRET: 'y', GDRIVE_REFRESH_TOKEN: 'z' };
     const response = await handleRequest(new Request('https://mirror.test/api/rhydive/library/alpha-1/archive'), hybrid, routed);
@@ -194,15 +200,40 @@ describe('asset sourcing', () => {
     expect(syncPaths).toContain('/api/rhydive/assets/alpha-1/audio.mp3');
     // cold assets are neither fetched nor stored
     expect(syncPaths).not.toContain('/api/rhydive/assets/beta-2/SB/D1.png');
-    expect(bucket.has('alpha-1/bg.png')).toBe(true);
-    expect(bucket.has('beta-2/SB/D1.png')).toBe(false);
-    expect(bucket.has('alpha-1.zip')).toBe(false);
+    expect(bucket.has(bucket.generation('alpha-1').assetKeys!['bg.png']!)).toBe(true);
+    expect(bucket.has(bucket.generation('beta-2').assetKeys?.['SB/D1.png'] ?? 'beta-2/SB/D1.png')).toBe(false);
+    expect(bucket.has(bucket.generation('alpha-1').archiveKey)).toBe(false);
   });
 
   it('still stores the archive when the layout asks for it', async () => {
     const { bucket, official } = await harness({ SYNC_ASSET_MODE: 'hot', SYNC_ASSET_SOURCE: 'origin' });
-    expect(bucket.has('alpha-1.zip')).toBe(true);
+    expect(bucket.has(bucket.generation('alpha-1').archiveKey)).toBe(true);
     expect(official.archiveFetches).toBeGreaterThan(0);
-    expect(new Uint8Array(bucket.bytes('alpha-1.zip'))).toEqual(official.zipOf('alpha-1'));
+    expect(new Uint8Array(bucket.bytes(bucket.generation('alpha-1').archiveKey))).toEqual(official.zipOf('alpha-1'));
+  });
+});
+
+describe('cross-layout cleanup', () => {
+  it('removes the same retired key from both physical tiers', async () => {
+    const { bucket, drive, routed } = await harness({ STORAGE_LAYOUT: 'hybrid' });
+    const key = bucket.generation('alpha-1').archiveKey;
+    // Emulate a previous layout leaving a second copy in R2.
+    await bucket.put(key, 'old-copy');
+    expect(bucket.has(key)).toBe(true);
+    const driveHasKey = [...drive.files.values()].some((file) => decodeURIComponent(file.name) === key);
+    expect(driveHasKey).toBe(true);
+    const env: Env = {
+      MIRROR: asR2Bucket(bucket),
+      STORAGE_LAYOUT: 'hybrid',
+      GDRIVE_CLIENT_ID: 'id',
+      GDRIVE_CLIENT_SECRET: 'secret',
+      GDRIVE_REFRESH_TOKEN: 'token',
+      GDRIVE_API_BASE: 'https://www.googleapis.com',
+    };
+    const store = createBulkStore(env, resolveConfig(env), routed);
+    expect(store.deleteEverywhere).toBeDefined();
+    await store.deleteEverywhere!([key]);
+    expect(bucket.has(key)).toBe(false);
+    expect([...drive.files.values()].some((file) => decodeURIComponent(file.name) === key)).toBe(false);
   });
 });

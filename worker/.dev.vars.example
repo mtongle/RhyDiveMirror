@@ -11,4 +11,5 @@ SYNC_BUDGET_MS=600000
 # GDRIVE_CLIENT_ID=your-client-id.apps.googleusercontent.com
 # GDRIVE_CLIENT_SECRET=GOCSPX-your-secret
 # GDRIVE_REFRESH_TOKEN=1//your-refresh-token
-# GDRIVE_FOLDER_ID=root  # optional, leave empty to auto-create "RhyDiveMirror" folder
+# GDRIVE_FOLDER_ID=optional-folder-id  # omit to auto-create/find "RhyDiveMirror"
+# GDRIVE_TEAM_DRIVE_ID=optional-shared-drive-id

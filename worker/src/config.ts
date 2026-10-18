@@ -173,12 +173,22 @@ export const KEYS = {
   library: '_catalog/library.json',
   /** Per-song download manifest served as `/api/rhydive/library/<id>/download`. */
   manifest: (id: string) => `_catalog/manifests/${id}.json`,
+  /** Immutable manifest for one published archive generation. */
+  manifestVersion: (id: string, hash: string) => `_catalog/manifests/${id}/${hash}.json`,
+  /** Atomic pointer switched after all objects of a generation exist. */
+  current: (id: string) => `_catalog/songs/${id}.json`,
   /** Sync bookkeeping (not part of the public surface). */
   state: '_catalog/sync-state.json',
+  /** Short lease shared by cron and manual sync runs. */
+  syncLock: '_catalog/sync-lock.json',
   /** Official `archive` object, byte-identical to the official ZIP. */
   archive: (id: string) => `${id}.zip`,
+  /** Immutable archive generation; readers holding an old pointer stay valid. */
+  archiveVersion: (id: string, hash: string) => `_objects/archives/${id}/${hash}.zip`,
   /** A single extracted archive entry. */
   asset: (id: string, name: string) => `${id}/${name}`,
+  /** Immutable asset generation bound to one archive hash. */
+  assetVersion: (id: string, hash: string, name: string) => `_objects/assets/${id}/${hash}/${name}`,
 } as const;
 
 export function resolveConfig(env: Env): Config {

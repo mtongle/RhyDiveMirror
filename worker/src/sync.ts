@@ -16,15 +16,93 @@ import { createBulkStore, type BulkStore } from './storage';
 import { extractEntry, readCentralDirectory, type ZipEntry } from './zip';
 import {
   loadState,
+  loadStateWithVersion,
   planPending,
   pruneSongs,
   saveState,
+  SyncBusyError,
   type SongFailure,
   type SongRecord,
+  type RetiredGeneration,
+  type SyncLease,
   type SyncError,
   type SyncRun,
   type SyncState,
 } from './state';
+
+const LEASE_SKEW_MS = 5_000;
+
+export async function readSyncLease(bucket: R2Bucket): Promise<SyncLease | null> {
+  const object = await bucket.get(KEYS.syncLock);
+  if (!object) return null;
+  try {
+    const lease = JSON.parse(await object.text()) as SyncLease;
+    return lease && typeof lease.owner === 'string' ? lease : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Acquire a small R2-backed lease before touching sync state. R2 conditional
+ * writes make this atomic even when cron and an operator invoke sync at once.
+ */
+export async function acquireSyncLease(bucket: R2Bucket, owner: string, ttlMs: number): Promise<SyncLease> {
+  const now = Date.now();
+  const lease: SyncLease = {
+    owner,
+    acquiredAt: new Date(now).toISOString(),
+    expiresAt: new Date(now + Math.max(ttlMs, 30_000)).toISOString(),
+  };
+  const current = await bucket.head(KEYS.syncLock);
+  const body = JSON.stringify(lease);
+  if (!current) {
+    const result = await bucket.put(KEYS.syncLock, body, {
+      onlyIf: { etagDoesNotMatch: '*' },
+      httpMetadata: { contentType: 'application/json; charset=utf-8', cacheControl: 'no-store' },
+    });
+    if (result) return lease;
+  } else {
+    const existing = await readSyncLease(bucket);
+    if (existing && Date.parse(existing.expiresAt) > now + LEASE_SKEW_MS) throw new SyncBusyError(existing);
+    const result = await bucket.put(KEYS.syncLock, body, {
+      onlyIf: { etagMatches: current.etag },
+      httpMetadata: { contentType: 'application/json; charset=utf-8', cacheControl: 'no-store' },
+    });
+    if (result) return lease;
+  }
+  throw new SyncBusyError(await readSyncLease(bucket));
+}
+
+export async function releaseSyncLease(bucket: R2Bucket, owner: string): Promise<void> {
+  const current = await readSyncLease(bucket);
+  if (current?.owner === owner) await bucket.delete(KEYS.syncLock);
+}
+
+const MIN_LEASE_MS = 15 * 60_000 + 60_000;
+
+function leaseTtlMs(config: Config): number {
+  // A single archive request can take up to 15 minutes. The lease must not
+  // expire while that request is still advancing a song.
+  return Math.max(config.budgetMs * 3, MIN_LEASE_MS);
+}
+
+export async function renewSyncLease(bucket: R2Bucket, owner: string, ttlMs: number): Promise<void> {
+  const current = await readSyncLease(bucket);
+  if (current?.owner !== owner) throw new SyncBusyError(current);
+  const now = Date.now();
+  const next: SyncLease = {
+    ...current,
+    expiresAt: new Date(now + Math.max(ttlMs, 30_000)).toISOString(),
+  };
+  const object = await bucket.head(KEYS.syncLock);
+  if (!object) throw new SyncBusyError(null);
+  const result = await bucket.put(KEYS.syncLock, JSON.stringify(next), {
+    onlyIf: { etagMatches: object.etag },
+    httpMetadata: { contentType: 'application/json; charset=utf-8', cacheControl: 'no-store' },
+  });
+  if (!result) throw new SyncBusyError(await readSyncLease(bucket));
+}
 
 export interface SyncOptions {
   /** Bulk store to write to; defaults to one built from the configuration. */
@@ -37,6 +115,12 @@ export interface SyncOptions {
   budgetMs?: number;
   /** Existing state, to avoid a redundant read. */
   state?: SyncState;
+  /** ETag paired with `state`; omit only when the caller owns the state read. */
+  stateEtag?: string | null;
+  /** Owner id for the sync lease; normally supplied by acquireSyncLease. */
+  owner?: string;
+  /** Set false only for tests that call runSync in isolation. */
+  lock?: boolean;
 }
 
 export interface SyncResult {
@@ -51,8 +135,28 @@ export async function runSync(
   options: SyncOptions = {},
   fetchImpl: FetchLike = globalFetch,
 ): Promise<SyncResult> {
+  if (options.lock === false) return runSyncUnlocked(env, config, options, fetchImpl, null);
+  const owner = options.owner ?? crypto.randomUUID();
+  await acquireSyncLease(env.MIRROR, owner, leaseTtlMs(config));
+  try {
+    return await runSyncUnlocked(env, config, { ...options, owner }, fetchImpl, owner);
+  } finally {
+    await releaseSyncLease(env.MIRROR, owner).catch(() => undefined);
+  }
+}
+
+async function runSyncUnlocked(
+  env: Env,
+  config: Config,
+  options: SyncOptions,
+  fetchImpl: FetchLike,
+  lockOwner: string | null,
+): Promise<SyncResult> {
   const startedAt = Date.now();
-  const state = options.state ?? (await loadState(env.MIRROR));
+  const loaded = options.state
+    ? { state: options.state, etag: options.stateEtag ?? (await currentStateEtag(env.MIRROR)) }
+    : await loadStateWithVersion(env.MIRROR);
+  const state = loaded.state;
   const store = options.store ?? createBulkStore(env, config, fetchImpl);
   const client = new OfficialClient(config, fetchImpl);
   const maxSongs = options.maxSongs ?? config.maxSongsPerTick;
@@ -103,7 +207,11 @@ export async function runSync(
       continue;
     }
     try {
+      const previous = state.songs[songId];
       const record = await syncSong(env, config, client, songId, catalogHashes.get(songId), store);
+      if (previous && previous.archiveHash !== record.archiveHash) {
+        state.retired.push(toRetired(songId, previous));
+      }
       state.songs[songId] = record;
       delete failures[songId];
       processed += 1;
@@ -127,6 +235,9 @@ export async function runSync(
   if (state.removed.length > 0) {
     await cleanupRemoved(env, store, state, maxSongs * 2);
   }
+  // A generation retired by this tick may still be referenced by a reader that
+  // fetched the previous pointer moments ago. Reclaim it on a later tick.
+  await cleanupRetired(env, store, state, maxSongs * 4, errors, startedAt);
 
   let repaired = 0;
   if (catalog) {
@@ -149,9 +260,57 @@ export async function runSync(
     errors: errors.slice(0, 25),
   };
   state.lastRun = run;
-  await saveState(env.MIRROR, state);
+  if (lockOwner) {
+    await renewSyncLease(env.MIRROR, lockOwner, leaseTtlMs(config));
+  }
+  await saveState(env.MIRROR, state, loaded.etag);
 
   return { run, state, catalog };
+}
+
+function toRetired(songId: string, record: SongRecord): RetiredGeneration {
+  return {
+    songId,
+    archiveHash: record.archiveHash,
+    archiveKey: record.archiveKey ?? KEYS.archive(songId),
+    manifestKey: KEYS.manifestVersion(songId, record.archiveHash),
+    assetKeys: Object.values(record.assetKeys ?? {}),
+    storageKind: record.storageKind,
+    retiredAt: new Date().toISOString(),
+  };
+}
+
+async function cleanupRetired(
+  env: Env,
+  store: BulkStore,
+  state: SyncState,
+  budget: number,
+  errors: SyncError[],
+  notBefore: number,
+): Promise<void> {
+  const kept: RetiredGeneration[] = [];
+  let removed = 0;
+  for (const item of state.retired) {
+    if (Date.parse(item.retiredAt) >= notBefore) {
+      kept.push(item);
+      continue;
+    }
+    if (removed >= budget) {
+      kept.push(item);
+      continue;
+    }
+    try {
+      const keys = [item.archiveKey, ...item.assetKeys];
+      if (store.deleteEverywhere) await store.deleteEverywhere(keys);
+      else await store.delete(keys);
+      await env.MIRROR.delete(item.manifestKey);
+      removed += 1;
+    } catch (error) {
+      kept.push(item);
+      errors.push({ id: item.songId, message: `retired generation cleanup failed: ${describe(error)}`, at: new Date().toISOString() });
+    }
+  }
+  state.retired = kept;
 }
 
 /** Materialise one song: archive + manifest + assets. */
@@ -183,7 +342,14 @@ export async function syncSong(
     }
     const entries = readCentralDirectory(new Uint8Array(archiveBytes));
     byName = new Map(entries.map((entry) => [entry.name, entry]));
-    // Check entry name security and entry presence before publishing
+    const manifestNames = new Set(manifest.files.map((file) => file.name.toLowerCase()));
+    const archiveNames = new Set(entries.filter((entry) => !entry.name.endsWith('/')).map((entry) => entry.name.toLowerCase()));
+    if (entries.length !== manifest.files.length || archiveNames.size !== manifestNames.size) {
+      throw new Error(
+        `archive entry set mismatch for ${songId}: archive=${entries.length} manifest=${manifest.files.length}`,
+      );
+    }
+    // Check entry name security and exact entry set before publishing.
     for (const file of manifest.files) {
       if (!safeEntryName(file.name)) throw new Error(`manifest contains unsafe file name: ${file.name}`);
       if (!byName.has(file.name)) throw new Error(`archive for ${songId} is missing manifest entry ${file.name}`);
@@ -199,22 +365,81 @@ export async function syncSong(
     }
   }
 
-  // Publish: manifest first (it describes the archive), then the archive, then assets.
+  let storedAssetBytes = 0;
+  const assetKeys: Record<string, string> = {};
+  const assetPaths: Record<string, string> = {};
+  const archiveKey = storeArchive ? KEYS.archiveVersion(songId, archiveHash) : KEYS.archive(songId);
+  const manifestKey = KEYS.manifestVersion(songId, archiveHash);
+  const manifestPath = `/api/rhydive/library/${encodeURIComponent(songId)}/download`;
+  const archivePath = `/api/rhydive/library/${encodeURIComponent(songId)}/archive`;
+  const newlyWritten: string[] = [];
+  let committed = false;
+  try {
+    await mapLimit(extracted, 8, async (item) => {
+      const key = KEYS.assetVersion(songId, archiveHash, item.name);
+      const options = {
+        contentType: contentTypeFor(item.name),
+        cacheControl: 'public, max-age=31536000, immutable' as const,
+      };
+      await store.put(key, item.bytes, options);
+      newlyWritten.push(key);
+      assetKeys[item.name] = key;
+      assetPaths[item.name] = `/api/rhydive/assets/${encodeURIComponent(songId)}/${item.name
+        .split('/')
+        .map(encodeURIComponent)
+        .join('/')}`;
+      storedAssetBytes += item.bytes.byteLength;
+    });
+    if (storeArchive) {
+      await putArchive(store, songId, archiveBytes!, archiveHash, archiveKey);
+      newlyWritten.push(archiveKey);
+    }
+
+  // The immutable objects are complete before anything becomes reachable.
+  // The generation pointer is the commit record: write it before the mutable
+  // legacy paths so a crash at any point leaves either the previous generation
+  // or a fully prepared new one.
+  const current = {
+    archiveHash,
+    archiveKey,
+    manifestKey,
+    archivePath,
+    manifestPath,
+    assetPaths,
+    assetKeys,
+    publishedAt: new Date().toISOString(),
+  };
+    await env.MIRROR.put(manifestKey, JSON.stringify(manifest), {
+      httpMetadata: { contentType: 'application/json; charset=utf-8', cacheControl: 'public, max-age=31536000, immutable' },
+    });
+    newlyWritten.push(manifestKey);
+    await env.MIRROR.put(KEYS.current(songId), JSON.stringify(current), {
+      httpMetadata: { contentType: 'application/json; charset=utf-8', cacheControl: 'no-store' },
+    });
+    committed = true;
+  } finally {
+    if (!committed && newlyWritten.length > 0) {
+      const cleanup = store.deleteEverywhere ? store.deleteEverywhere(newlyWritten) : store.delete(newlyWritten);
+      await cleanup.catch(() => undefined);
+      await env.MIRROR.delete(newlyWritten.filter((key) => key.startsWith('_catalog/'))).catch(() => undefined);
+    }
+  }
+  // Compatibility mirror for older readers/tools. Failures here cannot
+  // invalidate the committed generation.
   await env.MIRROR.put(KEYS.manifest(songId), JSON.stringify(manifest), {
     httpMetadata: { contentType: 'application/json; charset=utf-8', cacheControl: 'public, max-age=60' },
-  });
-  if (storeArchive) await putArchive(store, songId, archiveBytes!, archiveHash);
-
-  let storedAssetBytes = 0;
-  await mapLimit(extracted, 8, async (item) => {
-    await store.put(KEYS.asset(songId, item.name), item.bytes, {
-      contentType: contentTypeFor(item.name),
-      cacheControl: 'public, max-age=31536000, immutable',
-    });
-    storedAssetBytes += item.bytes.byteLength;
-  });
+  }).catch(() => undefined);
   let assetBytes = 0;
   for (const file of manifest.files) assetBytes += file.size;
+  const storedByTier: Record<string, number> = {};
+  const addBytes = (tier: string, bytes: number) => {
+    storedByTier[tier] = (storedByTier[tier] ?? 0) + bytes;
+  };
+  for (const [name, key] of Object.entries(assetKeys)) {
+    const file = manifest.files.find((candidate) => candidate.name === name);
+    if (file) addBytes(store.tierOf?.(key) ?? store.kind, file.size);
+  }
+  if (storeArchive) addBytes(store.tierOf?.(archiveKey) ?? store.kind, archiveBytes?.byteLength ?? manifest.archive.size);
 
   return {
     archiveHash,
@@ -226,6 +451,14 @@ export async function syncSong(
     materialized: config.assetMode,
     syncedAt: new Date().toISOString(),
     title: manifest.song.title ?? songId,
+    storedBytes: Object.values(storedByTier).reduce((total, bytes) => total + bytes, 0),
+    storedByTier,
+    storageKind: store.kind,
+    manifestPath,
+    archivePath,
+    assetPaths,
+    archiveKey,
+    assetKeys,
   };
 }
 
@@ -273,8 +506,14 @@ async function extractWanted(
   return out;
 }
 
-async function putArchive(store: BulkStore, songId: string, bytes: ArrayBuffer, sha256: string): Promise<void> {
-  await store.put(KEYS.archive(songId), bytes, {
+async function putArchive(
+  store: BulkStore,
+  songId: string,
+  bytes: ArrayBuffer,
+  sha256: string,
+  key: string = KEYS.archive(songId),
+): Promise<void> {
+  await store.put(key, bytes, {
     contentType: 'application/zip',
     cacheControl: 'public, max-age=31536000, immutable',
     customMetadata: { sha256 },
@@ -359,14 +598,22 @@ async function cleanupRemoved(env: Env, store: BulkStore, state: SyncState, budg
       // The manifest still lists every object, so no bucket listing is needed
       // (which matters on Drive, where listing means paging the whole folder).
       const names: string[] = [];
+      const record = state.songs[songId];
       const manifestObject = await env.MIRROR.get(KEYS.manifest(songId));
       if (manifestObject) {
         const manifest = (await manifestObject.json()) as OfficialManifest;
         for (const file of manifest.files ?? []) names.push(KEYS.asset(songId, file.name));
       }
-      if (names.length > 0) await store.delete(names);
-      await store.delete([KEYS.archive(songId)]);
-      await env.MIRROR.delete([KEYS.manifest(songId)]);
+      if (record?.assetKeys) names.push(...Object.values(record.assetKeys));
+      const manifests = [KEYS.manifest(songId)];
+      if (record?.archiveHash) manifests.push(KEYS.manifestVersion(songId, record.archiveHash));
+      // Delete bulk objects first. If any operation fails, retain the stable
+      // manifest and pointer so the next tick can reconstruct this cleanup.
+      const keys = names.concat(record?.archiveKey ? [KEYS.archive(songId), record.archiveKey] : [KEYS.archive(songId)]);
+      if (store.deleteEverywhere) await store.deleteEverywhere(keys);
+      else await store.delete(keys);
+      await env.MIRROR.delete(manifests);
+      await env.MIRROR.delete([KEYS.current(songId)]);
       done.push(songId);
     } catch {
       // Leave it queued; the next tick retries.
@@ -401,4 +648,9 @@ function describe(error: unknown): string {
   if (error instanceof OfficialError) return error.message;
   if (error instanceof Error) return error.message;
   return String(error);
+}
+
+async function currentStateEtag(bucket: R2Bucket): Promise<string | null> {
+  const object = await bucket.head(KEYS.state);
+  return object?.etag ?? null;
 }

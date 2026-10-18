@@ -25,10 +25,25 @@ export interface SongRecord {
   assetBytes: number;
   /** Asset bytes actually written to R2 during sync (0 in `lazy` mode). */
   storedAssetBytes: number;
+  /** Bytes materialised by the most recent successful sync. */
+  storedBytes?: number;
+  /** Which backend the bytes above were written to. */
+  storageKind?: string;
+  /** Exact materialised bytes, grouped by the tier that owns each key. */
+  storedByTier?: Record<string, number>;
   /** Which extraction policy succeeded for this song. */
   materialized: 'all' | 'hot' | 'lazy';
   syncedAt: string;
   title: string;
+  /** Request path of the active immutable manifest. */
+  manifestPath?: string;
+  /** Request path of the active immutable archive. */
+  archivePath?: string;
+  /** Content-addressed keys for assets materialised with this archive. */
+  assetPaths?: Record<string, string>;
+  /** Internal object keys, used for exact cleanup of a superseded generation. */
+  archiveKey?: string;
+  assetKeys?: Record<string, string>;
 }
 
 export interface SyncError {
@@ -43,6 +58,24 @@ export interface SongFailure {
   lastAt: string;
   /** Catalog hash observed at the last attempt, used to detect upstream changes. */
   catalogHash: string;
+}
+
+export interface SyncLease {
+  owner: string;
+  acquiredAt: string;
+  expiresAt: string;
+}
+
+export class SyncBusyError extends Error {
+  constructor(readonly lease: SyncLease | null) {
+    super('another sync run is active');
+  }
+}
+
+export class StateConflictError extends Error {
+  constructor() {
+    super('sync state changed while this run was active');
+  }
 }
 
 export interface SyncRun {
@@ -69,9 +102,22 @@ export interface SyncState {
   pending: string[];
   /** Song ids no longer present upstream and awaiting cleanup. */
   removed: string[];
+  /** Superseded generations retained long enough for in-flight readers. */
+  retired: RetiredGeneration[];
   /** Per-song failure bookkeeping, keyed by song id (drives retry backoff). */
   failures?: Record<string, SongFailure>;
   lastRun: SyncRun | null;
+}
+
+export interface RetiredGeneration {
+  songId: string;
+  archiveHash: string;
+  archiveKey: string;
+  manifestKey: string;
+  assetKeys: string[];
+  /** Tier that held the superseded generation when it was retired. */
+  storageKind?: string;
+  retiredAt: string;
 }
 
 export function emptyState(): SyncState {
@@ -82,34 +128,64 @@ export function emptyState(): SyncState {
     songs: {},
     pending: [],
     removed: [],
+    retired: [],
     failures: {},
     lastRun: null,
   };
 }
 
+export interface LoadedState {
+  state: SyncState;
+  etag: string | null;
+}
+
 export async function loadState(bucket: R2Bucket): Promise<SyncState> {
+  return (await loadStateWithVersion(bucket)).state;
+}
+
+export async function loadStateWithVersion(bucket: R2Bucket): Promise<LoadedState> {
   const object = await bucket.get(KEYS.state);
-  if (!object) return emptyState();
+  if (!object) return { state: emptyState(), etag: null };
   try {
     const parsed = JSON.parse(await object.text()) as SyncState;
-    if (!parsed || typeof parsed !== 'object' || parsed.version !== STATE_VERSION) return emptyState();
+    if (!parsed || typeof parsed !== 'object' || parsed.version !== STATE_VERSION) {
+      return { state: emptyState(), etag: object.etag };
+    }
     return {
-      ...emptyState(),
-      ...parsed,
-      songs: parsed.songs ?? {},
-      pending: parsed.pending ?? [],
-      removed: parsed.removed ?? [],
-      failures: parsed.failures ?? {},
+      etag: object.etag,
+      state: {
+        ...emptyState(),
+        ...parsed,
+        songs: parsed.songs ?? {},
+        pending: parsed.pending ?? [],
+        removed: parsed.removed ?? [],
+        retired: parsed.retired ?? [],
+        failures: parsed.failures ?? {},
+      },
     };
   } catch {
-    return emptyState();
+    return { state: emptyState(), etag: object.etag };
   }
 }
 
-export async function saveState(bucket: R2Bucket, state: SyncState): Promise<void> {
-  await bucket.put(KEYS.state, JSON.stringify(state), {
+/**
+ * Persist state only if it has not changed since `expectedEtag` was read.
+ * A null ETag means the object must still be absent. R2 returns null when the
+ * precondition fails, which becomes an explicit conflict instead of silently
+ * losing a newer run's queue/progress.
+ */
+export async function saveState(
+  bucket: R2Bucket,
+  state: SyncState,
+  expectedEtag: string | null | undefined,
+): Promise<void> {
+  const result = await bucket.put(KEYS.state, JSON.stringify(state), {
+    ...(expectedEtag === undefined ? {} : {
+      onlyIf: expectedEtag === null ? { etagDoesNotMatch: '*' } : { etagMatches: expectedEtag },
+    }),
     httpMetadata: { contentType: 'application/json; charset=utf-8', cacheControl: 'no-store' },
   });
+  if (!result) throw new StateConflictError();
 }
 
 /**
@@ -142,4 +218,14 @@ export function planPending(
 
 export function pruneSongs(state: SyncState, ids: string[]): void {
   for (const id of ids) delete state.songs[id];
+}
+
+/** Recompute queue membership after an explicit catalog refresh. */
+export function replanState(state: SyncState, songs: { id: string; archiveHash: string }[]): void {
+  const plan = planPending(state, songs);
+  state.songs = state.songs ?? {};
+  state.pending = plan.pending;
+  state.removed = plan.removed;
+  state.officialSongCount = songs.length;
+  state.catalogFetchedAt = new Date().toISOString();
 }

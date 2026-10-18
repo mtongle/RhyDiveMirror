@@ -2,6 +2,8 @@ import { describe, expect, it } from 'vitest';
 import { resolveConfig, type Env } from '../src/config';
 import { handleRequest } from '../src/index';
 import { runSync } from '../src/sync';
+import { acquireSyncLease, releaseSyncLease } from '../src/sync';
+import { loadState } from '../src/state';
 import { FakeR2, asR2Bucket } from './helpers/fake-r2';
 import { FakeOfficial, type FixtureSong } from './helpers/official';
 
@@ -109,6 +111,12 @@ describe('mirror reads', () => {
     const etag = first.headers.get('etag')!;
     const second = await call('/api/rhydive/assets/alpha-1/bg.png', { headers: { 'if-none-match': etag } });
     expect(second.status).toBe(304);
+    const head = await call('/api/rhydive/assets/alpha-1/bg.png', {
+      method: 'HEAD',
+      headers: { 'if-none-match': etag },
+    });
+    expect(head.status).toBe(304);
+    expect(head.headers.get('etag')).toBe(etag);
   });
 
   it('extracts a cached-away asset from the stored archive on demand', async () => {
@@ -121,6 +129,17 @@ describe('mirror reads', () => {
     expect(await response.text()).toBe('osu file format v14');
     // write-through caches it for the next request
     expect(bucket.has('alpha-1/chart.osu')).toBe(true);
+  });
+
+  it('keeps the ETag stable across lazy extraction and write-through caching', async () => {
+    const { call } = await seeded({ SYNC_ASSET_MODE: 'lazy' });
+    const first = await call('/api/rhydive/assets/alpha-1/chart.osu');
+    const etag = first.headers.get('etag');
+    expect(etag).toBeTruthy();
+    await first.text();
+    const cached = await call('/api/rhydive/assets/alpha-1/chart.osu', { headers: { 'if-none-match': etag! } });
+    expect(cached.status).toBe(304);
+    expect(cached.headers.get('etag')).toBe(etag);
   });
 
   it('supports ranged reads of a lazily extracted asset', async () => {
@@ -228,6 +247,32 @@ describe('admin surface', () => {
     expect(sync.status).toBe(200);
     expect(((await sync.json()) as { success: boolean }).success).toBe(true);
   });
+
+  it('rebuilds catalog state and refuses while another sync holds the lease', async () => {
+    const { bucket, env, call } = await seeded({ SYNC_TOKEN: 'secret-token' });
+    const before = await loadState(env.MIRROR);
+    expect(before.pending).toEqual([]);
+
+    const rebuilt = await call('/__admin/catalog', {
+      method: 'POST',
+      headers: { authorization: 'Bearer secret-token' },
+    });
+    expect(rebuilt.status).toBe(200);
+    expect((await rebuilt.json()) as { success: boolean }).toMatchObject({ success: true });
+    const after = await loadState(env.MIRROR);
+    expect(after.officialSongCount).toBe(2);
+    expect(after.pending).toEqual([]);
+
+    await acquireSyncLease(env.MIRROR, 'holder', 60_000);
+    const busy = await call('/__admin/catalog', {
+      method: 'POST',
+      headers: { authorization: 'Bearer secret-token' },
+    });
+    expect(busy.status).toBe(409);
+    expect(await busy.json()).toMatchObject({ code: 'sync_busy' });
+    await releaseSyncLease(env.MIRROR, 'holder');
+    void bucket;
+  });
 });
 
 describe('health', () => {
@@ -235,6 +280,42 @@ describe('health', () => {
     const { call } = await seeded();
     const response = await call('/__health');
     expect(response.status).toBe(200);
-    expect(((await response.json()) as { ok: boolean }).ok).toBe(true);
+    const payload = (await response.json()) as {
+      ok: boolean;
+      warnings: string[];
+      mirror: { syncSource: string; assetMode: string; storageLayout: string };
+    };
+    expect(payload.ok).toBe(true);
+    expect(payload.mirror.syncSource).toBe('api');
+    expect(payload.mirror.assetMode).toBe('all');
+    expect(payload.mirror.storageLayout).toBe('r2');
+    expect(payload.warnings.join(' ')).toMatch(/10 GB/);
+  });
+
+  it('returns JSON for a storage configuration failure', async () => {
+    const official = new FakeOfficial({
+      songs: songs.map((song) => ({ ...song, entries: [...song.entries] })),
+    });
+    const env: Env = {
+      MIRROR: asR2Bucket(new FakeR2()),
+      OFFICIAL_ORIGIN: official.origin,
+      OFFICIAL_CDN_ORIGIN: official.cdnOrigin,
+      STORAGE_LAYOUT: 'gdrive',
+    };
+    const fetchImpl = official.fetch as unknown as typeof fetch;
+    const call = (path: string, init?: RequestInit) =>
+      handleRequest(new Request(`https://mirror.test${path}`, init), env, fetchImpl);
+    const resource = await call('/api/rhydive/assets/alpha-1/bg.png');
+    expect(resource.status).toBe(500);
+    expect(resource.headers.get('content-type')).toContain('application/json');
+    expect(await resource.json()).toMatchObject({ success: false });
+
+    const health = await call('/__health');
+    expect(health.status).toBe(500);
+    expect(health.headers.get('content-type')).toContain('application/json');
+    const payload = (await health.json()) as { ok: boolean; error: string; warnings: string[] };
+    expect(payload.ok).toBe(false);
+    expect(payload.error).toMatch(/GDRIVE_CLIENT_ID/);
+    expect(payload.warnings.join(' ')).toMatch(/GDRIVE/);
   });
 });

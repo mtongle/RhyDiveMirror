@@ -12,12 +12,13 @@
  * serve path and the sync path do not care which backend is behind it.
  */
 import type { Config, StorageLayout } from './config';
+import { isHotAsset } from './assets';
 import { globalFetch, type FetchLike } from './fetch';
 import { GDriveBulkStore } from './gdrive';
 
 export interface BulkHead {
   size: number;
-  etag: string;
+  etag?: string;
   uploaded: Date;
   contentType?: string;
   cacheControl?: string;
@@ -28,6 +29,7 @@ export interface BulkBody extends BulkHead {
   body?: ReadableStream | null;
   arrayBuffer(): Promise<ArrayBuffer>;
   text(): Promise<string>;
+  json<T = unknown>(): Promise<T>;
 }
 
 export interface BulkPutOptions {
@@ -40,6 +42,10 @@ export interface BulkPutOptions {
 
 export interface BulkStore {
   readonly kind: string;
+  /** Tier holding this particular key under the current layout. */
+  tierOf?(key: string): 'r2' | 'gdrive';
+  /** Delete exactly from both configured physical tiers. */
+  deleteEverywhere?(keys: string[]): Promise<void>;
   head(key: string): Promise<BulkHead | null>;
   get(key: string, range?: { offset: number; length: number }): Promise<BulkBody | null>;
   put(key: string, value: ArrayBuffer | Uint8Array | string, options?: BulkPutOptions): Promise<void>;
@@ -80,6 +86,7 @@ export class R2BulkStore implements BulkStore {
       body: object.body,
       arrayBuffer: () => object.arrayBuffer(),
       text: () => object.text(),
+      json: () => object.json(),
     };
   }
 
@@ -130,7 +137,10 @@ export class TieredBulkStore implements BulkStore {
     for (const tier of this.readOrder(key)) {
       const store = this.storeFor(tier);
       if (!store) continue;
-      const found = await store.head(key).catch(() => null);
+      // Only a real "not found" may advance to the next tier. Treating a
+      // throttled Drive request as a miss would turn a transient 403 into a
+      // misleading origin fallback (or 404).
+      const found = await store.head(key);
       if (found) return found;
     }
     return null;
@@ -140,7 +150,7 @@ export class TieredBulkStore implements BulkStore {
     for (const tier of this.readOrder(key)) {
       const store = this.storeFor(tier);
       if (!store) continue;
-      const found = await store.get(key, range).catch(() => null);
+      const found = await store.get(key, range);
       if (found) return found;
     }
     return null;
@@ -154,10 +164,23 @@ export class TieredBulkStore implements BulkStore {
 
   async delete(keys: string[]): Promise<void> {
     if (keys.length === 0) return;
-    // Delete from both tiers so cleanup is layout-independent.
-    await Promise.all(
-      [this.r2, this.drive].filter(Boolean).map((store) => store!.delete(keys).catch(() => undefined)),
-    );
+    // Delete from both tiers so cleanup is layout-independent. R2 accepts at
+    // most 1000 keys per operation; manifests can contain up to 5000 entries.
+    // Failures propagate so the caller can keep the removal queued.
+    const stores = [this.r2, this.drive].filter((store): store is BulkStore => store !== null);
+    for (let offset = 0; offset < keys.length; offset += 1_000) {
+      const chunk = keys.slice(offset, offset + 1_000);
+      await Promise.all(stores.map((store) => store.delete(chunk)));
+    }
+  }
+
+  async deleteEverywhere(keys: string[]): Promise<void> {
+    if (keys.length === 0) return;
+    const stores = [this.r2, this.drive].filter((store): store is BulkStore => store !== null);
+    for (let offset = 0; offset < keys.length; offset += 1_000) {
+      const chunk = keys.slice(offset, offset + 1_000);
+      await Promise.all(stores.map((store) => store.delete(chunk)));
+    }
   }
 
   async status(): Promise<Record<string, unknown>> {
@@ -168,20 +191,16 @@ export class TieredBulkStore implements BulkStore {
     return { layout: this.layout, r2, gdrive: drive };
   }
 
+  tierOf(key: string): 'r2' | 'gdrive' {
+    return this.primaryOf(key);
+  }
+
   private readOrder(key: string): ('r2' | 'gdrive')[] {
     const primary = this.primaryOf(key);
     if (!this.drive || this.layout === 'r2') return ['r2'];
     if (this.layout === 'gdrive') return ['gdrive', 'r2'];
     return primary === 'r2' ? ['r2', 'gdrive'] : ['gdrive', 'r2'];
   }
-}
-
-/** True for the small, latency-sensitive assets served while browsing. */
-export function isHotAssetKey(key: string): boolean {
-  const name = key.slice(key.indexOf('/') + 1);
-  const base = name.split('/').pop() ?? name;
-  if (/^(bg|background|cover|audio|preview)\./i.test(base)) return true;
-  return /\.osu$/i.test(base);
 }
 
 /**
@@ -193,8 +212,9 @@ export function primaryTierFor(layout: StorageLayout, key: string): 'r2' | 'gdri
   if (key.startsWith('_catalog/')) return 'r2';
   if (layout === 'r2') return 'r2';
   if (layout === 'gdrive') return 'gdrive';
-  // In hybrid layout: archives (*.zip) live in Google Drive; all assets live in R2
-  return key.endsWith('.zip') ? 'gdrive' : 'r2';
+  // Hybrid: keep the interactive cover/audio/beatmap path in R2 and send
+  // archives plus cold storyboard/video assets to Drive.
+  return key.endsWith('.zip') || !isHotAsset(key.slice(key.indexOf('/') + 1)) ? 'gdrive' : 'r2';
 }
 
 export function createBulkStore(

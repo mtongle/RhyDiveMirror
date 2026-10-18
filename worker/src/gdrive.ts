@@ -117,7 +117,7 @@ export class GDriveBulkStore implements BulkStore {
   private async resolveFolder(): Promise<string> {
     const cached = await this.readMeta<{ id: string }>(FOLDER_KEY);
     if (cached?.id) {
-      const exists = await this.request(`/files/${cached.id}?fields=id,trashed&supportsAllDrives=true`).catch(() => null);
+      const exists = await this.request(`/files/${cached.id}?${this.listParams({ fields: 'id,trashed' }).toString()}`).catch(() => null);
       if (exists && exists.ok) {
         const info = (await exists.json()) as { id?: string; trashed?: boolean };
         if (info.id && !info.trashed) return info.id;
@@ -125,7 +125,9 @@ export class GDriveBulkStore implements BulkStore {
     }
     // Search for an existing "RhyDiveMirror" folder in Drive before creating a duplicate
     const query = `name = 'RhyDiveMirror' and mimeType = '${FOLDER_MIME}' and trashed = false`;
-    const search = await this.request(`/files?q=${encodeURIComponent(query)}&fields=files(id)&pageSize=1&supportsAllDrives=true`).catch(() => null);
+    const search = await this.request(
+      `/files?${this.listParams({ q: query, fields: 'files(id)', pageSize: '1' }).toString()}`,
+    ).catch(() => null);
     if (search && search.ok) {
       const list = (await search.json().catch(() => null)) as { files?: { id: string }[] } | null;
       if (list?.files && list.files.length > 0 && list.files[0]?.id) {
@@ -137,7 +139,11 @@ export class GDriveBulkStore implements BulkStore {
     const created = await this.request(`/drive/v3/files?fields=id&supportsAllDrives=true`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ name: 'RhyDiveMirror', mimeType: FOLDER_MIME }),
+      body: JSON.stringify({
+        name: 'RhyDiveMirror',
+        mimeType: FOLDER_MIME,
+        ...(this.config.teamDriveId ? { parents: [this.config.teamDriveId] } : {}),
+      }),
     });
     if (!created.ok) throw new GDriveError(`cannot create Drive folder (${created.status})`, created.status);
     const payload = (await created.json()) as { id: string };
@@ -181,6 +187,7 @@ export class GDriveBulkStore implements BulkStore {
       body: response.body,
       arrayBuffer: () => response.arrayBuffer(),
       text: () => response.text(),
+      json: () => response.json(),
     };
   }
 
@@ -200,7 +207,7 @@ export class GDriveBulkStore implements BulkStore {
 
   async delete(keys: string[]): Promise<void> {
     for (const key of keys) {
-      const file = await this.find(key).catch(() => null);
+      const file = await this.find(key);
       if (!file) continue;
       const response = await this.request(`/files/${file.id}?supportsAllDrives=true`, { method: 'DELETE' });
       if (!response.ok && response.status !== 404) {
@@ -267,12 +274,10 @@ export class GDriveBulkStore implements BulkStore {
   private async find(key: string): Promise<DriveFile | null> {
     const parent = await this.folderId();
     const query = `name = '${escapeQuery(encodeName(key))}' and '${parent}' in parents and trashed = false`;
-    const params = new URLSearchParams({
+    const params = this.listParams({
       q: query,
       fields: 'files(id,name,size,md5Checksum,modifiedTime,mimeType,appProperties)',
       pageSize: '10',
-      supportsAllDrives: 'true',
-      includeItemsFromAllDrives: 'true',
     });
     const response = await this.request(`/files?${params.toString()}`);
     if (!response.ok) {
@@ -281,6 +286,16 @@ export class GDriveBulkStore implements BulkStore {
     }
     const payload = (await response.json()) as { files?: DriveFile[] };
     return payload.files?.[0] ?? null;
+  }
+
+  /** Shared-drive listing needs a corpus and driveId; My Drive must not send one. */
+  private listParams(values: Record<string, string>): URLSearchParams {
+    const params = new URLSearchParams({ ...values, supportsAllDrives: 'true', includeItemsFromAllDrives: 'true' });
+    if (this.config.teamDriveId) {
+      params.set('corpora', 'drive');
+      params.set('driveId', this.config.teamDriveId);
+    }
+    return params;
   }
 
   private async multipartUpload(name: string, bytes: Uint8Array, mimeType: string, parents: string[]): Promise<void> {

@@ -16,6 +16,12 @@ interface GetOptions {
   range?: { offset: number; length: number };
 }
 
+interface PutOptions {
+  httpMetadata?: { contentType?: string; cacheControl?: string };
+  customMetadata?: Record<string, string>;
+  onlyIf?: { etagMatches?: string; etagDoesNotMatch?: string };
+}
+
 function etagOf(bytes: Uint8Array): string {
   return `"${createHash('md5').update(bytes).digest('hex')}"`;
 }
@@ -25,6 +31,9 @@ export class FakeR2 {
   puts = 0;
   deletes = 0;
   gets = 0;
+  deleteBatches: number[] = [];
+  failPutKey: string | null = null;
+  failDeleteKey: string | null = null;
 
   async get(key: string, options?: GetOptions): Promise<unknown> {
     this.gets += 1;
@@ -68,8 +77,14 @@ export class FakeR2 {
   async put(
     key: string,
     value: unknown,
-    options?: { httpMetadata?: { contentType?: string; cacheControl?: string }; customMetadata?: Record<string, string> },
+    options?: PutOptions,
   ): Promise<unknown> {
+    if (this.failPutKey === key) throw new Error(`injected R2 put failure: ${key}`);
+    const existing = this.objects.get(key);
+    if (options?.onlyIf?.etagMatches !== undefined) {
+      if (!existing || etagOf(existing.bytes) !== options.onlyIf.etagMatches) return null;
+    }
+    if (options?.onlyIf?.etagDoesNotMatch === '*' && existing) return null;
     this.puts += 1;
     const bytes = await toBytes(value);
     this.objects.set(key, {
@@ -83,7 +98,12 @@ export class FakeR2 {
   }
 
   async delete(keys: string | string[]): Promise<void> {
-    for (const key of Array.isArray(keys) ? keys : [keys]) {
+    const list = Array.isArray(keys) ? keys : [keys];
+    this.deleteBatches.push(list.length);
+    if (this.failDeleteKey && list.includes(this.failDeleteKey)) {
+      throw new Error(`injected R2 delete failure: ${this.failDeleteKey}`);
+    }
+    for (const key of list) {
       this.deletes += 1;
       this.objects.delete(key);
     }
@@ -113,6 +133,17 @@ export class FakeR2 {
     return [...this.objects.keys()].sort();
   }
 
+  /** Object keys referenced by the active-generation pointer. */
+  generation(songId: string): {
+    archiveHash: string;
+    archiveKey: string;
+    manifestKey: string;
+    assetPaths: Record<string, string>;
+    assetKeys?: Record<string, string>;
+  } {
+    return this.json(`_catalog/songs/${songId}.json`);
+  }
+
   text(key: string): string {
     const found = this.objects.get(key);
     if (!found) throw new Error(`missing key: ${key}`);
@@ -127,6 +158,12 @@ export class FakeR2 {
     const found = this.objects.get(key);
     if (!found) throw new Error(`missing key: ${key}`);
     return found.bytes;
+  }
+
+  etag(key: string): string {
+    const found = this.objects.get(key);
+    if (!found) throw new Error(`missing key: ${key}`);
+    return etagOf(found.bytes);
   }
 }
 

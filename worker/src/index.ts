@@ -4,15 +4,16 @@
  *   chart downloads  -> served from R2 (kept in sync with the official API)
  *   everything else  -> forwarded to the official API untouched
  *
- * See ../docs/ARCHITECTURE.md for the full design and configuration.
+ * See ../docs/ARCHITECTURE.md for the full design and ../docs/API.md for the
+ * reverse-engineered contract this mirrors.
  */
 import { handleAdmin } from './admin';
-import { type Env, resolveConfig } from './config';
+import { type Env, KEYS, resolveConfig } from './config';
 import { globalFetch, type FetchLike } from './fetch';
 import { applyCors, json, preflight } from './http';
 import { classify, type Route } from './layout';
-import { originUrls, sourceUrls } from './official';
-import { serveAsset, serveObject } from './mirror';
+import { originUrls } from './official';
+import { activeGeneration, serveAsset, serveObject } from './mirror';
 import { proxyRequest } from './proxy';
 import { createBulkStore, type BulkStore } from './storage';
 import { runSync, type SyncResult } from './sync';
@@ -22,6 +23,24 @@ import { runSync, type SyncResult } from './sync';
  * a fake official origin.
  */
 export async function handleRequest(request: Request, env: Env, fetchImpl: FetchLike = globalFetch): Promise<Response> {
+  try {
+    return await routeRequest(request, env, fetchImpl);
+  } catch (error) {
+    // Cloudflare's default exception response is HTML, which the RhyDive
+    // client treats as a fatal mirror failure. Preserve machine-readable errors
+    // even for an unexpected backend or transport failure.
+    console.error(JSON.stringify({ event: 'request.error', path: new URL(request.url).pathname, message: describeError(error) }));
+    return applyCors(
+      json(
+        { success: false, code: 'mirror_unavailable', message: 'mirror request failed' },
+        { status: 503, headers: { 'cache-control': 'no-store' } },
+      ),
+      request,
+    );
+  }
+}
+
+async function routeRequest(request: Request, env: Env, fetchImpl: FetchLike): Promise<Response> {
   const config = resolveConfig(env);
   const url = new URL(request.url);
   // A misconfigured storage tier must not take down /__health or /__admin.
@@ -41,15 +60,23 @@ export async function handleRequest(request: Request, env: Env, fetchImpl: Fetch
   }
 
   if (url.pathname === '/__health') {
+    const warnings = deploymentWarnings(config);
     return json(
       {
         ok: storeError === null,
         service: 'rhydive-mirror',
         ...(storeError ? { error: storeError } : {}),
+        warnings,
         mirror: {
           apiPrefix: config.apiPrefix,
           assetMode: config.assetMode,
+          syncSource: config.syncSource,
+          hashMode: config.hashMode,
           storageLayout: config.storageLayout,
+          archiveMode: config.archiveMode,
+          assetSource: config.assetSource,
+          mirrorFallbackProxy: config.mirrorFallbackProxy,
+          assetWriteThrough: config.assetWriteThrough,
           officialOrigin: config.officialOrigin,
           officialCdnOrigin: config.officialCdnOrigin,
         },
@@ -104,6 +131,26 @@ export async function handleRequest(request: Request, env: Env, fetchImpl: Fetch
   return forward(request, config, url.pathname, fetchImpl);
 }
 
+function deploymentWarnings(config: ReturnType<typeof resolveConfig>): string[] {
+  const warnings: string[] = [];
+  if (config.storageLayout === 'r2' && config.archiveMode === 'store' && config.assetMode !== 'lazy') {
+    warnings.push(
+      'R2-only archive+assets may exceed the 10 GB free storage tier for the full library; run tools/plan-capacity.mjs',
+    );
+  }
+  if (config.assetMode === 'lazy') {
+    warnings.push('lazy asset extraction can exceed the Workers Free CPU limit; use a paid CPU limit');
+  }
+  if ((config.storageLayout === 'gdrive' || config.storageLayout === 'hybrid') && !config.gdrive) {
+    warnings.push('Google Drive layout selected without GDRIVE_* configuration');
+  }
+  return warnings;
+}
+
+function describeError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
 export async function handleScheduled(env: Env, fetchImpl: FetchLike = globalFetch): Promise<SyncResult> {
   const config = resolveConfig(env);
   return runSync(env, config, {}, fetchImpl);
@@ -127,11 +174,22 @@ async function serveRoute(
 ): Promise<Response | null> {
   switch (route.kind) {
     case 'catalog':
-    case 'manifest':
       return serveObject(request, store, route.key!, { fallbackType: 'application/json; charset=utf-8' });
+    case 'manifest': {
+      const generation = await activeGeneration(store, route.songId!);
+      if (generation?.manifestKey) {
+        return serveObject(request, store, generation.manifestKey, {
+          fallbackType: 'application/json; charset=utf-8',
+        });
+      }
+      return serveObject(request, store, route.key!, { fallbackType: 'application/json; charset=utf-8' });
+    }
     case 'archive':
       if (config.archiveMode === 'proxy') return null;
-      return serveObject(request, store, route.key!, { fallbackType: 'application/zip' });
+      {
+        const generation = await activeGeneration(store, route.songId!);
+        return serveObject(request, store, generation?.archiveKey ?? route.key!, { fallbackType: 'application/zip' });
+      }
     case 'asset':
       return serveAsset(request, store, config, route.songId!, route.assetName!);
     default:
@@ -173,25 +231,17 @@ async function onMirrorMiss(
 
   const onApiSurface = pathname.startsWith(`${config.apiPrefix}/`);
   if (target && (onApiSurface || config.mirrorFallbackProxy)) {
-    const res = await proxyRequest(request, { url: target, host }, fetchImpl);
-    // If upstream primary source returned 520, 522, 526, or 5xx, try the fallback source
-    if (res.status >= 500 && config.syncSource === 'cdn') {
-      const fallbackUrls = sourceUrls(config, 'api');
-      const altTarget =
-        route.kind === 'catalog'
-          ? fallbackUrls.catalog
-          : route.kind === 'manifest' && route.songId
-            ? fallbackUrls.manifest(route.songId)
-            : route.kind === 'archive' && route.songId
-              ? fallbackUrls.archive(route.songId)
-              : route.kind === 'asset' && route.songId && route.assetName
-                ? fallbackUrls.asset(route.songId, route.assetName)
-                : null;
-      if (altTarget) {
-        return proxyRequest(request, { url: altTarget, host }, fetchImpl);
-      }
+    const response = await proxyRequest(request, { url: target, host }, fetchImpl);
+    const contentType = response.headers.get('content-type') ?? '';
+    const isChartResource = route.kind === 'archive' || route.kind === 'asset';
+    if (isChartResource && response.ok && /text\/html/i.test(contentType)) {
+      await response.body?.cancel();
+      return json(
+        { success: false, code: 'origin_returned_html', message: 'official source returned HTML for a chart resource' },
+        { status: 502, headers: { 'cache-control': 'no-store' } },
+      );
     }
-    return res;
+    return response;
   }
   return json(
     { success: false, message: `not mirrored yet: ${route.songId ?? pathname}` },

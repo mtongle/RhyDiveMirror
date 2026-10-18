@@ -23,11 +23,13 @@ export interface ZipEntry {
   /** Byte offset of the local file header. */
   localHeaderOffset: number;
   flags: number;
+  /** Absolute archive offset (present for entries read from a sliced view). */
+  archiveOffset?: number;
 }
 
 export class ZipError extends Error {}
 
-export function readCentralDirectory(bytes: Uint8Array): ZipEntry[] {
+export function readCentralDirectory(bytes: Uint8Array, archiveOffset = 0): ZipEntry[] {
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   const eocd = findEocd(view);
   if (eocd < 0) throw new ZipError('ZIP end-of-central-directory record not found');
@@ -44,10 +46,16 @@ export function readCentralDirectory(bytes: Uint8Array): ZipEntry[] {
     cdOffset = zip64.cdOffset;
   }
 
-  if (cdOffset + cdSize > bytes.byteLength) throw new ZipError('central directory lies outside the archive');
+  // The central directory offsets in the file are absolute within the original
+  // archive. Convert them to coordinates of this buffer so callers can parse a
+  // tail slice without reading the entire ZIP.
+  const relativeCdOffset = cdOffset - archiveOffset;
+  if (relativeCdOffset < 0 || relativeCdOffset + cdSize > bytes.byteLength) {
+    throw new ZipError('central directory lies outside the archive');
+  }
 
   const entries: ZipEntry[] = [];
-  let cursor = cdOffset;
+  let cursor = relativeCdOffset;
   for (let index = 0; index < entryCount; index++) {
     if (cursor + 46 > bytes.byteLength) throw new ZipError('truncated central directory');
     if (view.getUint32(cursor, true) !== SIG_CENTRAL) throw new ZipError(`bad central directory signature at ${cursor}`);
@@ -82,7 +90,16 @@ export function readCentralDirectory(bytes: Uint8Array): ZipEntry[] {
 
     if (flags & 0x1) throw new ZipError(`encrypted archive entry: ${name}`);
 
-    entries.push({ name, method, compressedSize, uncompressedSize, crc32, localHeaderOffset, flags });
+    entries.push({
+      name,
+      method,
+      compressedSize,
+      uncompressedSize,
+      crc32,
+      localHeaderOffset,
+      flags,
+      archiveOffset,
+    });
     cursor = extraEnd + commentLength;
   }
   return entries;
@@ -96,7 +113,7 @@ export interface ExtractResult {
 /** Extract one entry, returning its *uncompressed* bytes. */
 export async function extractEntry(bytes: Uint8Array, entry: ZipEntry): Promise<Uint8Array> {
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-  const local = entry.localHeaderOffset;
+  const local = entry.localHeaderOffset - (entry.archiveOffset ?? 0);
   if (local + 30 > bytes.byteLength) throw new ZipError(`truncated local header for ${entry.name}`);
   if (view.getUint32(local, true) !== SIG_LOCAL) throw new ZipError(`bad local header signature for ${entry.name}`);
   const nameLength = view.getUint16(local + 26, true);

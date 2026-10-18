@@ -98,8 +98,8 @@ export interface OriginUrls {
   asset(songId: string, assetName: string): string;
 }
 
-export function sourceUrls(config: Config, source: 'api' | 'cdn'): OriginUrls {
-  const cdn = source === 'cdn';
+export function originUrls(config: Config): OriginUrls {
+  const cdn = config.syncSource === 'cdn';
   const encodeName = (name: string) => name.split('/').map(encodeURIComponent).join('/');
   return {
     catalog: cdn
@@ -124,10 +124,6 @@ export function sourceUrls(config: Config, source: 'api' | 'cdn'): OriginUrls {
         : `${config.officialOrigin}/api/rhydive/assets/${id}/${encodeName(assetName)}`;
     },
   };
-}
-
-export function originUrls(config: Config): OriginUrls {
-  return sourceUrls(config, config.syncSource);
 }
 
 export class OfficialClient {
@@ -156,53 +152,15 @@ export class OfficialClient {
       await response.body?.cancel();
       throw new OfficialError(`${label} redirected (${response.status}${location ? ` → ${location}` : ''})`);
     }
+    if (!response.ok) {
+      await response.body?.cancel();
+      throw new OfficialError(`${label} responded ${response.status}`, response.status);
+    }
     return response;
   }
 
-  private async fetchWithFallback(
-    getUrl: (urls: OriginUrls) => string,
-    label: string,
-    init: RequestInit = {},
-    timeoutMs = 120_000,
-  ): Promise<Response> {
-    const primaryUrls = sourceUrls(this.config, this.config.syncSource);
-    const fallbackSource = this.config.syncSource === 'cdn' ? 'api' : 'cdn';
-    const fallbackUrls = sourceUrls(this.config, fallbackSource);
-    const primaryTarget = getUrl(primaryUrls);
-    const fallbackTarget = getUrl(fallbackUrls);
-
-    let lastError: unknown;
-    try {
-      const res = await this.request(primaryTarget, `${label} (${this.config.syncSource})`, init, timeoutMs);
-      if (res.ok) return res;
-      // 5xx errors (e.g. Cloudflare 520, 522, 526) mean the source has TLS or connectivity issues.
-      // Automatically fallback to the alternative source so sync never stalls!
-      if (res.status >= 500) {
-        await res.body?.cancel();
-      } else {
-        await res.body?.cancel();
-        throw new OfficialError(`${label} responded ${res.status}`, res.status);
-      }
-    } catch (err: unknown) {
-      if (err instanceof OfficialError && err.status && err.status < 500) {
-        throw err;
-      }
-      lastError = err;
-    }
-
-    try {
-      const fallbackRes = await this.request(fallbackTarget, `${label} (${fallbackSource} fallback)`, init, timeoutMs);
-      if (fallbackRes.ok) return fallbackRes;
-      await fallbackRes.body?.cancel();
-      throw new OfficialError(`${label} failed on primary and fallback (${fallbackRes.status})`, fallbackRes.status);
-    } catch (fallbackErr) {
-      if (lastError) throw lastError;
-      throw fallbackErr;
-    }
-  }
-
   async fetchCatalog(): Promise<OfficialCatalog> {
-    const response = await this.fetchWithFallback((urls) => urls.catalog, 'catalog', {}, TIMEOUTS.catalog);
+    const response = await this.request(this.urls.catalog, `catalog (${this.config.syncSource})`, {}, TIMEOUTS.catalog);
     const payload = (await response.json()) as OfficialCatalog;
     if (!payload || payload.success !== true || !Array.isArray(payload.songs)) {
       throw new OfficialError('official catalog payload is not a valid song list');
@@ -211,6 +169,7 @@ export class OfficialClient {
       if (
         !song ||
         typeof song.id !== 'string' ||
+        !/^[A-Za-z0-9._~-]{1,96}$/.test(song.id) ||
         typeof song.archiveHash !== 'string' ||
         !/^[a-f0-9]{64}$/.test(song.archiveHash)
       ) {
@@ -221,9 +180,9 @@ export class OfficialClient {
   }
 
   async fetchManifest(songId: string): Promise<OfficialManifest> {
-    const response = await this.fetchWithFallback(
-      (urls) => urls.manifest(songId),
-      `manifest ${songId}`,
+    const response = await this.request(
+      this.urls.manifest(songId),
+      `manifest ${songId} (${this.config.syncSource})`,
       {},
       TIMEOUTS.manifest,
     );
@@ -233,24 +192,44 @@ export class OfficialClient {
       manifest.success !== true ||
       manifest.song?.id !== songId ||
       !Array.isArray(manifest.files) ||
-      manifest.files.length === 0
+      manifest.files.length === 0 ||
+      manifest.files.length > 5_000
     ) {
       throw new OfficialError(`manifest for ${songId} is invalid`);
     }
+    const names = new Set<string>();
+    let expandedBytes = 0;
     for (const file of manifest.files) {
+      if (!file || typeof file.name !== 'string' || !file.name) {
+        throw new OfficialError(`manifest for ${songId} contains an invalid file name`);
+      }
+      const lowerName = file.name.toLowerCase();
+      if (names.has(lowerName)) throw new OfficialError(`manifest for ${songId} contains duplicate file names`);
+      names.add(lowerName);
       const expected = `/api/rhydive/assets/${songId}/${file.name
         .split('/')
         .map(encodeURIComponent)
         .join('/')}`;
       if (file.url !== expected) throw new OfficialError(`manifest for ${songId} has an unexpected file url: ${file.url}`);
-      if (!Number.isSafeInteger(file.size) || file.size < 0) throw new OfficialError(`bad size for ${file.name}`);
+      if (!Number.isSafeInteger(file.size) || file.size < 0 || file.size > 128 * 1024 * 1024) {
+        throw new OfficialError(`bad size for ${file.name}`);
+      }
       if (!/^[a-f0-9]{64}$/.test(file.sha256)) throw new OfficialError(`bad sha256 for ${file.name}`);
+      expandedBytes += file.size;
+    }
+    if (expandedBytes > 512 * 1024 * 1024) {
+      throw new OfficialError(`manifest for ${songId} exceeds the client's expanded-size limit`);
     }
     const archive = manifest.archive;
     if (!archive || archive.url !== `/api/rhydive/library/${songId}/archive`) {
       throw new OfficialError(`manifest for ${songId} has an unexpected archive url`);
     }
-    if (!Number.isSafeInteger(archive.size) || archive.size <= 0 || !/^[a-f0-9]{64}$/.test(archive.sha256)) {
+    if (
+      !Number.isSafeInteger(archive.size) ||
+      archive.size <= 0 ||
+      archive.size > 256 * 1024 * 1024 ||
+      !/^[a-f0-9]{64}$/.test(archive.sha256)
+    ) {
       throw new OfficialError(`manifest for ${songId} has an invalid archive descriptor`);
     }
     return manifest;
@@ -262,9 +241,9 @@ export class OfficialClient {
    * against the manifest's sha256 before it is published.
    */
   async fetchAsset(songId: string, assetName: string, expectedSize: number, timeoutMs = TIMEOUTS.asset): Promise<ArrayBuffer> {
-    const response = await this.fetchWithFallback(
-      (urls) => urls.asset(songId, assetName),
-      `asset ${songId}/${assetName}`,
+    const response = await this.request(
+      this.urls.asset(songId, assetName),
+      `asset ${songId}/${assetName} (${this.config.syncSource})`,
       { headers: { accept: '*/*' } },
       timeoutMs,
     );
@@ -279,9 +258,9 @@ export class OfficialClient {
 
   /** Download the official archive exactly as published (byte-for-byte). */
   async fetchArchive(songId: string, expectedSize: number): Promise<ArrayBuffer> {
-    const response = await this.fetchWithFallback(
-      (urls) => urls.archive(songId),
-      `archive ${songId}`,
+    const response = await this.request(
+      this.urls.archive(songId),
+      `archive ${songId} (${this.config.syncSource})`,
       { headers: { accept: 'application/zip' } },
       TIMEOUTS.archive,
     );

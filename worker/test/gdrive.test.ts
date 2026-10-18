@@ -20,6 +20,31 @@ function harness(options: ConstructorParameters<typeof FakeDrive>[0] = {}) {
   return { meta, drive, store };
 }
 
+function sharedHarness(
+  options: ConstructorParameters<typeof FakeDrive>[0] = {},
+  folderId = 'shared-folder',
+) {
+  const meta = new FakeR2();
+  const drive = new FakeDrive(options);
+  const urls: string[] = [];
+  const recordedFetch = (input: RequestInfo | URL, init?: RequestInit) => {
+    urls.push(String(input));
+    return drive.fetch(input, init);
+  };
+  const config: GDriveConfig = {
+    clientId: 'client-id',
+    clientSecret: 'client-secret',
+    refreshToken: 'refresh-token',
+    folderId,
+    teamDriveId: 'shared-drive',
+    apiBase: drive.origin,
+    tokenUrl: 'https://oauth2.googleapis.com/token',
+    chunkSizeBytes: 8 * 1024 * 1024,
+  };
+  const store = new GDriveBulkStore(asR2Bucket(meta) as unknown as R2Bucket, config, recordedFetch);
+  return { meta, drive, store, urls };
+}
+
 const bytes = (text: string) => new TextEncoder().encode(text);
 
 describe('GDriveBulkStore', () => {
@@ -115,5 +140,28 @@ describe('GDriveBulkStore', () => {
     await expect(store.get('alpha-1/bg.png')).rejects.toThrow(/403/);
     // The next call succeeds; the failure was not cached.
     expect(await store.head('alpha-1/bg.png')).not.toBeNull();
+  });
+
+  it('surfaces lookup failures during delete instead of silently skipping', async () => {
+    const { store } = harness({ failLookups: 1 });
+    await expect(store.delete(['alpha-1/bg.png'])).rejects.toThrow(/lookup.*500/);
+  });
+
+  it('sends shared-drive corpus parameters and parents', async () => {
+    const { store, urls } = sharedHarness();
+    await store.put('alpha-1/bg.png', bytes('x'), { contentType: 'image/png' });
+    const lookup = urls.find((url) => url.includes('/files?') && url.includes('name'));
+    expect(lookup).toBeDefined();
+    expect(lookup).toContain('corpora=drive');
+    expect(lookup).toContain('driveId=shared-drive');
+  });
+
+  it('creates the default folder inside the configured shared drive', async () => {
+    const { store, drive, urls } = sharedHarness({}, '');
+    await store.put('alpha-1/bg.png', bytes('x'), { contentType: 'image/png' });
+    const folder = [...drive.files.values()].find((file) => file.name === 'RhyDiveMirror');
+    expect(folder).toBeDefined();
+    expect(folder?.parents).toContain('shared-drive');
+    expect(urls.some((url) => url.includes('corpora=drive') && url.includes('driveId=shared-drive'))).toBe(true);
   });
 });
