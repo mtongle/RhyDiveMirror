@@ -13,12 +13,12 @@ binding = "MIRROR"
 bucket_name = "rhydive-mirror"
 
 # How often the incremental sync runs. The lease serialises cron and operator
-# runs. After the initial bulk load, a twenty-minute interval is enough to pick
-# up new songs while keeping the free-plan budget modest.
+# runs. After the initial bulk load, ten minutes keeps new songs arriving quickly
+# while staying within the free-plan budget.
 # Free Workers allow 50 subrequests per invocation; eight songs with cached
 # metadata stay safely below that ceiling and recover automatically on 409.
 [triggers]
-crons = ["*/20 * * * *"]
+crons = ["*/10 * * * *"]
 
 [vars]
 OFFICIAL_ORIGIN = "https://sta.lunprin.com"
