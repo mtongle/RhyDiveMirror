@@ -8,6 +8,12 @@
 import { KEYS } from './config';
 
 export const STATE_VERSION = 1;
+/**
+ * Bump when a sync-side rule changes how previously attempted songs are
+ * interpreted. Failures recorded under an older rule must not be allowed to
+ * delay the newly fixed path by hours.
+ */
+export const SYNC_RULES_VERSION = 2;
 
 export interface SongRecord {
   /** sha256 of the stored archive — what the manifest advertises and we serve. */
@@ -58,6 +64,8 @@ export interface SongFailure {
   lastAt: string;
   /** Catalog hash observed at the last attempt, used to detect upstream changes. */
   catalogHash: string;
+  /** Rule generation that produced this failure. */
+  rulesVersion?: number;
 }
 
 export interface SyncLease {
@@ -207,6 +215,7 @@ export function planPending(
     if (failure && /too many subrequests/i.test(failure.lastError)) delete failures[song.id];
     // A changed catalog hash means upstream touched the song: clear the backoff.
     if (failure && failure.catalogHash !== song.archiveHash) delete failures[song.id];
+    if (failure && failure.rulesVersion !== SYNC_RULES_VERSION) delete failures[song.id];
     const record = state.songs[song.id];
     const known = record && (record.catalogHash === song.archiveHash || record.archiveHash === song.archiveHash);
     if (!known) pending.push(song.id);

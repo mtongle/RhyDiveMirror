@@ -368,6 +368,24 @@ describe('runSync', () => {
     expect(next.state.failures?.['alpha-1']).toBeUndefined();
   });
 
+  it('invalidates backoff recorded by an older sync rule generation', async () => {
+    const { env, config, official } = harness();
+    const state = await loadState(env.MIRROR);
+    state.pending = ['alpha-1'];
+    state.failures = {
+      'alpha-1': {
+        count: 10,
+        lastError: 'old rule generation',
+        lastAt: new Date().toISOString(),
+        catalogHash: (official.catalog().songs[0] as { archiveHash: string }).archiveHash,
+      },
+    };
+    await saveState(env.MIRROR, state, undefined);
+    const next = await runSync(env, config, {}, official.fetch as typeof fetch);
+    expect(next.run.processed).toBeGreaterThan(0);
+    expect(next.state.failures?.['alpha-1']).toBeUndefined();
+  });
+
   it('does not materialise assets in lazy mode but still stores the archive', async () => {
     const { bucket, env, fetchImpl } = harness({ SYNC_ASSET_MODE: 'lazy' });
     const config = resolveConfig(env);

@@ -20,6 +20,7 @@ import {
   planPending,
   pruneSongs,
   saveState,
+  SYNC_RULES_VERSION,
   SyncBusyError,
   type SongFailure,
   type SongRecord,
@@ -258,6 +259,7 @@ async function runSyncUnlocked(
         lastError: message,
         lastAt: now,
         catalogHash: catalogHashes.get(songId) ?? failure?.catalogHash ?? '',
+        rulesVersion: SYNC_RULES_VERSION,
       };
       errors.push({ id: songId, message, at: now });
       remaining.push(songId);
